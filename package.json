@@ -1,0 +1,44 @@
+{
+  "name": "moltspay-discordbot",
+  "version": "0.1.0",
+  "description": "MoltsPay Discord Bot - Server monetization with crypto payments",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "lint": "eslint src --ext .ts",
+    "deploy-commands": "tsx src/deploy-commands.ts",
+    "migrate": "tsx src/migrate.ts"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "moltspay",
+    "crypto",
+    "payments",
+    "usdc"
+  ],
+  "author": "MoltsPay",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "discord-api-types": "^0.38.43",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.16.0",
+    "express": "^4.19.2",
+    "moltspay": "^0.8.15"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.12.7",
+    "eslint": "^8.57.0",
+    "tsx": "^4.7.2",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
