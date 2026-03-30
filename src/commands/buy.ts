@@ -27,7 +27,7 @@ import { createPaymentSession } from '../services/payment';
 import { startPolling } from '../services/poller';
 import { COLORS, productListEmbed } from '../utils/embeds';
 import { getWalletLinks } from '../utils/deeplinks';
-import { buildOnrampUrl, calculateFiatPrice, isOnrampSupported, getOnrampChains } from '../utils/onramp';
+import { buildOnrampUrl, calculateFiatPrice, isOnrampSupported, getOnrampChains, hasOnrampCredentials } from '../utils/onramp';
 import type { Product, ServerConfig } from '../types';
 
 // Chain display names
@@ -120,9 +120,9 @@ async function showPaymentMethodSelection(
   serverId: string,
   server: ServerConfig
 ) {
-  // Check if card payments are available (any onramp-supported chain in product)
+  // Check if card payments are available (any onramp-supported chain + markup > 0 + credentials)
   const onrampChains = getOnrampChains(product.chains);
-  const hasCardOption = onrampChains.length > 0 && server.fiatMarkup > 0;
+  const hasCardOption = onrampChains.length > 0 && server.fiatMarkup > 0 && hasOnrampCredentials();
   
   const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
   const markupPercent = Math.round(server.fiatMarkup * 100);
@@ -315,7 +315,20 @@ async function showCardPayment(
   );
   
   const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
-  const onrampUrl = buildOnrampUrl(walletAddress, fiatPrice, chain, paymentId);
+  
+  // Get onramp URL (requires CDP API call)
+  let onrampUrl: string;
+  try {
+    onrampUrl = await buildOnrampUrl(walletAddress, fiatPrice, chain, paymentId);
+  } catch (error) {
+    console.error('Failed to generate onramp URL:', error);
+    await interaction.update({
+      content: `❌ Card payments are temporarily unavailable. Please use USDC instead.\n\nError: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      embeds: [],
+      components: []
+    });
+    return;
+  }
   
   const embed = new EmbedBuilder()
     .setTitle(`💳 Pay with Card`)
