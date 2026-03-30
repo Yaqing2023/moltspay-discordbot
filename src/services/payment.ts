@@ -12,6 +12,17 @@ export interface CreatePaymentResult {
   paymentId: string;
   paymentUrl: string;
   expiresAt: Date;
+  amount: number;  // Unique amount with random sub-cents
+}
+
+/**
+ * Generate unique payment amount by adding random sub-cents
+ * This prevents duplicate detection when multiple users pay same price
+ */
+function generateUniqueAmount(basePrice: number): number {
+  // Add random 0.001 to 0.009 to make each payment unique
+  const randomCents = Math.floor(Math.random() * 9 + 1) / 1000;
+  return Math.round((basePrice + randomCents) * 1000000) / 1000000; // USDC has 6 decimals
 }
 
 /**
@@ -30,12 +41,15 @@ export function createPaymentSession(
   // Use provided chain or default to first available chain
   const selectedChain = chain || product.chains[0];
   
+  // Generate unique amount to prevent duplicate detection
+  const uniqueAmount = generateUniqueAmount(product.price);
+  
   createPayment({
     paymentId,
     discordUserId: userId,
     discordServerId: serverId,
     productId: product.id,
-    amount: product.price,
+    amount: uniqueAmount,
     currency: product.currency,
     chain: selectedChain,
     status: 'pending',
@@ -50,7 +64,8 @@ export function createPaymentSession(
   return {
     paymentId,
     paymentUrl,
-    expiresAt
+    expiresAt,
+    amount: uniqueAmount
   };
 }
 

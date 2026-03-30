@@ -120,11 +120,12 @@ async function showPaymentMethodSelection(
   serverId: string,
   server: ServerConfig
 ) {
-  // Check if card payments are available (any onramp-supported chain + markup > 0 + credentials)
+  // Check if card payments are available
+  // Requirements: onramp-supported chain + markup > 0 + minimum $5 (Coinbase requirement)
   const onrampChains = getOnrampChains(product.chains);
-  const hasCardOption = onrampChains.length > 0 && server.fiatMarkup > 0 && hasOnrampCredentials();
-  
   const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
+  const MINIMUM_FIAT_AMOUNT = 5;
+  const hasCardOption = onrampChains.length > 0 && server.fiatMarkup > 0 && fiatPrice >= MINIMUM_FIAT_AMOUNT;
   const markupPercent = Math.round(server.fiatMarkup * 100);
   
   const embed = new EmbedBuilder()
@@ -166,36 +167,45 @@ async function showPaymentMethodSelection(
     embed.setFooter({ text: 'Pay with any crypto wallet' });
   }
   
-  const response = await interaction.reply({ 
+  await interaction.reply({ 
     embeds: [embed], 
-    components: [row], 
+    components: [row],
     ephemeral: true 
   });
   
-  // Wait for method selection
-  try {
-    const buttonInteraction = await response.awaitMessageComponent({
-      componentType: ComponentType.Button,
-      time: 120_000
-    });
+  // Get the reply message for collector
+  const message = await interaction.fetchReply();
+  
+  // Use collector for button handling
+  const collector = message.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    time: 120_000,
+    max: 1
+  });
+  
+  collector.on('collect', async (buttonInteraction) => {
+    const [_, method] = buttonInteraction.customId.split('_');
     
-    const [_, method, productId] = buttonInteraction.customId.split('_');
-    
-    if (method === 'usdc') {
-      // USDC: Show chain selection
-      await showChainSelection(buttonInteraction, product, serverId);
-    } else if (method === 'card') {
-      // Card: Auto-select best onramp chain and go to Coinbase
-      await showCardPayment(buttonInteraction, product, serverId, server);
+    try {
+      if (method === 'usdc') {
+        await showChainSelection(buttonInteraction, product, serverId);
+      } else if (method === 'card') {
+        await showCardPayment(buttonInteraction, product, serverId, server);
+      }
+    } catch (error) {
+      console.error('[Buy] Error handling button:', error);
     }
-    
-  } catch (error) {
-    await interaction.editReply({
-      content: '⏰ Selection timed out. Run `/buy` again to try.',
-      embeds: [],
-      components: []
-    });
-  }
+  });
+  
+  collector.on('end', async (collected, reason) => {
+    if (reason === 'time' && collected.size === 0) {
+      await interaction.editReply({
+        content: '⏰ Selection timed out. Run `/buy` again to try.',
+        embeds: [],
+        components: []
+      });
+    }
+  });
 }
 
 /**
@@ -206,6 +216,9 @@ async function showChainSelection(
   product: Product, 
   serverId: string
 ) {
+  // Acknowledge immediately to prevent Discord timeout
+  await interaction.deferUpdate();
+  
   // If only one chain, skip selection
   if (product.chains.length === 1) {
     const chain = product.chains[0];
@@ -248,18 +261,17 @@ async function showChainSelection(
     );
   }
   
-  await interaction.update({ 
+  const message = await interaction.editReply({ 
     embeds: [embed], 
     components: [row]
   });
   
   // Wait for chain selection
   try {
-    const buttonInteraction = await interaction.message.awaitMessageComponent({
+    const buttonInteraction = await message.awaitMessageComponent({
       componentType: ComponentType.Button,
       time: 120_000
     });
-    
     const [_, selectedChain, productId] = buttonInteraction.customId.split('_');
     const walletAddress = getServerWalletForChain(serverId, selectedChain);
     
@@ -292,13 +304,16 @@ async function showCardPayment(
   serverId: string,
   server: ServerConfig
 ) {
+  // Defer immediately - CDP API call can take several seconds
+  await interaction.deferUpdate();
+  
   // Auto-select best chain for onramp (prefer Base)
   const onrampChains = getOnrampChains(product.chains);
   const chain = onrampChains.includes('base') ? 'base' : onrampChains[0];
   
   const walletAddress = getServerWalletForChain(serverId, chain);
   if (!walletAddress) {
-    await interaction.update({ 
+    await interaction.editReply({ 
       content: `❌ No wallet configured for ${chain}. Please contact server admin.`,
       embeds: [],
       components: []
@@ -316,13 +331,13 @@ async function showCardPayment(
   
   const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
   
-  // Get onramp URL (requires CDP API call)
+  // Get onramp URL (requires CDP API call - this is slow)
   let onrampUrl: string;
   try {
     onrampUrl = await buildOnrampUrl(walletAddress, fiatPrice, chain, paymentId);
   } catch (error) {
     console.error('Failed to generate onramp URL:', error);
-    await interaction.update({
+    await interaction.editReply({
       content: `❌ Card payments are temporarily unavailable. Please use USDC instead.\n\nError: ${error instanceof Error ? error.message : 'Unknown error'}`,
       embeds: [],
       components: []
@@ -333,7 +348,7 @@ async function showCardPayment(
   const embed = new EmbedBuilder()
     .setTitle(`💳 Pay with Card`)
     .setColor(COLORS.PRIMARY)
-    .setDescription(`Complete your payment on Coinbase:\n\n**Amount:** $${fiatPrice.toFixed(2)} USD\n**You'll receive:** ${product.name}`)
+    .setDescription(`Complete your payment on Coinbase using **Fiat** (credit/debit card):\n\n**Amount:** $${fiatPrice.toFixed(2)} USD\n**You'll receive:** ${product.name}`)
     .addFields(
       { name: 'Chain', value: CHAIN_NAMES[chain] || chain.toUpperCase(), inline: true },
       { name: 'Expires', value: `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>`, inline: true }
@@ -353,7 +368,7 @@ async function showCardPayment(
         .setURL(onrampUrl)
     );
   
-  await interaction.update({ 
+  await interaction.editReply({ 
     embeds: [embed], 
     components: [row]
   });
@@ -374,16 +389,16 @@ async function showUsdcPayment(
   serverId: string,
   walletAddress: string
 ) {
-  // Create payment session
-  const { paymentId, expiresAt } = createPaymentSession(
+  // Create payment session with unique amount
+  const { paymentId, expiresAt, amount } = createPaymentSession(
     interaction.user.id,
     serverId,
     product,
     chain
   );
   
-  const embed = buildPaymentEmbed(product, chain, paymentId, expiresAt);
-  const rows = buildWalletButtons(chain, walletAddress, product.price, paymentId);
+  const embed = buildPaymentEmbed(product, chain, paymentId, expiresAt, amount);
+  const rows = buildWalletButtons(chain, walletAddress, amount, paymentId);
   
   await interaction.update({ 
     embeds: [embed], 
@@ -392,7 +407,7 @@ async function showUsdcPayment(
   
   // Start polling for payment (EVM chains only for now)
   if (['base', 'polygon', 'bnb'].includes(chain)) {
-    startPolling(paymentId, chain, walletAddress, product.price);
+    startPolling(paymentId, chain, walletAddress, amount);
   }
 }
 
@@ -400,7 +415,8 @@ function buildPaymentEmbed(
   product: Product,
   chain: string,
   paymentId: string,
-  expiresAt: Date
+  expiresAt: Date,
+  amount: number
 ): EmbedBuilder {
   const isEVM = ['base', 'polygon', 'bnb'].includes(chain);
   const description = isEVM
@@ -412,7 +428,7 @@ function buildPaymentEmbed(
     .setColor(COLORS.PRIMARY)
     .setDescription(description)
     .addFields(
-      { name: 'Price', value: `$${product.price.toFixed(2)} ${product.currency}`, inline: true },
+      { name: 'Price', value: `$${amount.toFixed(6)} ${product.currency}`, inline: true },
       { name: 'Chain', value: CHAIN_NAMES[chain] || chain.toUpperCase(), inline: true },
       { name: 'Expires', value: `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>`, inline: true }
     );
@@ -427,7 +443,7 @@ function buildPaymentEmbed(
   
   embed.addFields({ 
     name: '💡 Tip', 
-    value: `Mobile: amount auto-fills. Desktop: enter **$${product.price.toFixed(2)}** manually.`, 
+    value: `Mobile: amount auto-fills. Desktop: enter **$${amount.toFixed(6)}** manually.`, 
     inline: false 
   });
   

@@ -130,24 +130,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
   
-  // Handle button interactions
-  // Note: chain_ and pay_ buttons are handled by awaitMessageComponent in buy.ts
-  // Only handle other buttons here
-  if (interaction.isButton()) {
-    const customId = interaction.customId;
-    
-    // Skip buttons handled by command flows (awaitMessageComponent)
-    if (customId.startsWith('chain_') || customId.startsWith('pay_')) {
-      return; // Let the command's awaitMessageComponent handle it
-    }
-    
-    // Handle other buttons
-    const [action, type, id] = customId.split('_');
-    console.log(`Button clicked: ${action}_${type}_${id}`);
-    
-    // Placeholder response for unhandled buttons
-    await interaction.reply({ content: '⏳ Processing...', ephemeral: true });
-  }
+  // Button interactions are handled by awaitMessageComponent in command files
+  // Don't handle them here to avoid interference
 });
 
 // Start webhook server for payment notifications

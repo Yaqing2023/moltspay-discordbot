@@ -3,7 +3,7 @@
  */
 
 import { ethers } from 'ethers';
-import { getPayment, updatePayment, getProduct } from './database';
+import { getPayment, updatePayment, getProduct, isTxHashUsed } from './database';
 import { PaymentSession } from '../types';
 
 // RPC endpoints (same as MoltsPay)
@@ -95,21 +95,27 @@ export async function startPolling(
       );
 
       if (found) {
-        console.log(`[Poller] ${paymentId}: payment found! tx=${found.txHash}`);
-        stopPolling(paymentId);
-        
-        // Update payment status
-        updatePayment(paymentId, {
-          status: 'paid',
-          txHash: found.txHash,
-          paidAt: new Date()
-        });
+        // Check if this txHash was already used for another payment
+        if (isTxHashUsed(found.txHash)) {
+          console.log(`[Poller] ${paymentId}: found tx=${found.txHash} but already used, skipping`);
+          // Continue polling - this tx was for someone else
+        } else {
+          console.log(`[Poller] ${paymentId}: payment found! tx=${found.txHash}`);
+          stopPolling(paymentId);
+          
+          // Update payment status
+          updatePayment(paymentId, {
+            status: 'paid',
+            txHash: found.txHash,
+            paidAt: new Date()
+          });
 
-        // Trigger callback
-        if (onPaymentConfirmed) {
-          onPaymentConfirmed(paymentId, found.txHash);
+          // Trigger callback
+          if (onPaymentConfirmed) {
+            onPaymentConfirmed(paymentId, found.txHash);
+          }
+          return;
         }
-        return;
       }
 
       // Check if max polls reached

@@ -376,6 +376,17 @@ export function updatePayment(paymentId: string, updates: Partial<PaymentSession
   db.prepare(`UPDATE payments SET ${fields.join(', ')} WHERE payment_id = ?`).run(...values);
 }
 
+/**
+ * Check if a transaction hash has already been used for a confirmed payment
+ * Prevents double-spending: same tx can't confirm multiple payments
+ */
+export function isTxHashUsed(txHash: string): boolean {
+  const row = db.prepare(
+    "SELECT 1 FROM payments WHERE tx_hash = ? AND status IN ('paid', 'fulfilled') LIMIT 1"
+  ).get(txHash);
+  return !!row;
+}
+
 export function getServerSales(serverId: string, limit = 10): PaymentSession[] {
   const rows = db.prepare(`
     SELECT * FROM payments 
