@@ -56,6 +56,19 @@ function runMigrations(): void {
         ALTER TABLE products ADD COLUMN billing_period TEXT;
       `);
     }
+    
+    // Migration: Add fiat_markup to servers
+    const hasFiatMarkup = serverCols.some(c => c.name === 'fiat_markup');
+    if (!hasFiatMarkup && serverCols.length > 0) {
+      db.exec(`ALTER TABLE servers ADD COLUMN fiat_markup REAL DEFAULT 0.05`);
+    }
+    
+    // Migration: Add payment_method to payments
+    const paymentCols = db.prepare("PRAGMA table_info(payments)").all() as any[];
+    const hasPaymentMethod = paymentCols.some(c => c.name === 'payment_method');
+    if (!hasPaymentMethod && paymentCols.length > 0) {
+      db.exec(`ALTER TABLE payments ADD COLUMN payment_method TEXT DEFAULT 'usdc'`);
+    }
   } catch (e) {
     // Tables don't exist yet, will be created below
   }
@@ -68,6 +81,7 @@ function runMigrations(): void {
       evm_wallet TEXT,
       solana_wallet TEXT,
       default_chain TEXT DEFAULT 'base',
+      fiat_markup REAL DEFAULT 0.05,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -120,6 +134,7 @@ function runMigrations(): void {
       chain TEXT NOT NULL,
       status TEXT DEFAULT 'pending',
       tx_hash TEXT,
+      payment_method TEXT DEFAULT 'usdc',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       expires_at TEXT NOT NULL,
       paid_at TEXT,
@@ -166,8 +181,13 @@ export function getServer(serverId: string): ServerConfig | null {
     evmWallet: row.evm_wallet,
     solanaWallet: row.solana_wallet,
     defaultChain: row.default_chain,
+    fiatMarkup: row.fiat_markup ?? 0.05,
     createdAt: new Date(row.created_at)
   };
+}
+
+export function setServerFiatMarkup(serverId: string, markup: number): void {
+  db.prepare('UPDATE servers SET fiat_markup = ? WHERE server_id = ?').run(markup, serverId);
 }
 
 export function upsertServerWallet(serverId: string, walletType: 'evm' | 'solana', walletAddress: string): void {

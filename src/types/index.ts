@@ -8,6 +8,7 @@ export interface ServerConfig {
   evmWallet: string | null;
   solanaWallet: string | null;
   defaultChain: string;
+  fiatMarkup: number;
   createdAt: Date;
 }
 

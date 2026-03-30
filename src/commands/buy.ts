@@ -22,7 +22,8 @@ import { createPaymentSession } from '../services/payment';
 import { startPolling } from '../services/poller';
 import { COLORS, productListEmbed } from '../utils/embeds';
 import { getWalletLinks } from '../utils/deeplinks';
-import type { Product } from '../types';
+import { buildOnrampUrl, calculateFiatPrice, isOnrampSupported } from '../utils/onramp';
+import type { Product, ServerConfig } from '../types';
 
 // Chain display names
 const CHAIN_NAMES: Record<string, string> = {
@@ -175,6 +176,7 @@ async function showPaymentDetails(
   chain: string,
   serverId: string
 ) {
+  const server = getServer(serverId);
   const walletAddress = getServerWalletForChain(serverId, chain);
   if (!walletAddress) {
     await interaction.reply({ 
@@ -184,6 +186,111 @@ async function showPaymentDetails(
     return;
   }
   
+  // Show payment method selection if onramp is supported
+  if (server && isOnrampSupported(chain)) {
+    await showPaymentMethodSelection(interaction, product, chain, serverId, server);
+  } else {
+    // Direct to USDC payment
+    await showUsdcPayment(interaction, product, chain, serverId, walletAddress);
+  }
+}
+
+async function showPaymentMethodSelection(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  product: Product,
+  chain: string,
+  serverId: string,
+  server: ServerConfig
+) {
+  const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
+  const markupPercent = Math.round(server.fiatMarkup * 100);
+  
+  const embed = new EmbedBuilder()
+    .setTitle(`🛒 ${product.name}`)
+    .setColor(COLORS.PRIMARY)
+    .setDescription('Choose your payment method:')
+    .addFields(
+      { name: 'Chain', value: CHAIN_NAMES[chain] || chain.toUpperCase(), inline: true }
+    );
+  
+  if (product.type === 'role' && product.discordRoleId) {
+    embed.addFields({ name: 'You\'ll receive', value: `<@&${product.discordRoleId}>`, inline: true });
+  }
+  
+  embed.setFooter({ text: `Card payments include a ${markupPercent}% processing fee` });
+  
+  const row = new ActionRowBuilder<ButtonBuilder>()
+    .addComponents(
+      new ButtonBuilder()
+        .setCustomId(`pay_usdc_${product.id}_${chain}`)
+        .setLabel(`💎 Pay with USDC - $${product.price.toFixed(2)}`)
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`pay_fiat_${product.id}_${chain}`)
+        .setLabel(`💳 Pay with Card - $${fiatPrice.toFixed(2)}`)
+        .setStyle(ButtonStyle.Secondary)
+    );
+  
+  const replyOptions = { embeds: [embed], components: [row], ephemeral: true };
+  
+  if ('replied' in interaction && interaction.replied) {
+    await interaction.editReply(replyOptions);
+  } else if ('update' in interaction) {
+    await (interaction as ButtonInteraction).update(replyOptions);
+  } else {
+    const response = await (interaction as ChatInputCommandInteraction).reply(replyOptions);
+    
+    // Wait for payment method selection
+    try {
+      const buttonInteraction = await response.awaitMessageComponent({
+        componentType: ComponentType.Button,
+        time: 120_000
+      });
+      
+      await handlePaymentMethodSelection(buttonInteraction, product, chain, serverId, server);
+    } catch (error) {
+      await interaction.editReply({
+        content: '⏰ Selection timed out. Run `/buy` again to try.',
+        embeds: [],
+        components: []
+      });
+    }
+  }
+}
+
+async function handlePaymentMethodSelection(
+  interaction: ButtonInteraction,
+  product: Product,
+  chain: string,
+  serverId: string,
+  server: ServerConfig
+) {
+  const walletAddress = getServerWalletForChain(serverId, chain);
+  if (!walletAddress) {
+    await interaction.update({ 
+      content: `❌ No wallet configured for ${chain}.`,
+      embeds: [],
+      components: []
+    });
+    return;
+  }
+  
+  const [_, method, productId, selectedChain] = interaction.customId.split('_');
+  
+  if (method === 'usdc') {
+    await showUsdcPaymentFromButton(interaction, product, chain, serverId, walletAddress);
+  } else if (method === 'fiat') {
+    await showFiatPayment(interaction, product, chain, serverId, walletAddress, server);
+  }
+}
+
+async function showUsdcPayment(
+  interaction: ChatInputCommandInteraction,
+  product: Product,
+  chain: string,
+  serverId: string,
+  walletAddress: string
+) {
   // Create payment session
   const { paymentId, expiresAt } = createPaymentSession(
     interaction.user.id,
@@ -195,7 +302,7 @@ async function showPaymentDetails(
   const embed = buildPaymentEmbed(product, chain, paymentId, expiresAt);
   const rows = buildWalletButtons(chain, walletAddress, product.price, paymentId);
   
-  const response = await interaction.reply({ 
+  await interaction.reply({ 
     embeds: [embed], 
     components: rows, 
     ephemeral: true 
@@ -207,22 +314,13 @@ async function showPaymentDetails(
   }
 }
 
-async function showPaymentDetailsFromButton(
+async function showUsdcPaymentFromButton(
   interaction: ButtonInteraction,
   product: Product,
   chain: string,
-  serverId: string
+  serverId: string,
+  walletAddress: string
 ) {
-  const walletAddress = getServerWalletForChain(serverId, chain);
-  if (!walletAddress) {
-    await interaction.update({ 
-      content: `❌ No wallet configured for ${chain}. Please contact server admin.`,
-      embeds: [],
-      components: []
-    });
-    return;
-  }
-  
   // Create payment session
   const { paymentId, expiresAt } = createPaymentSession(
     interaction.user.id,
@@ -242,6 +340,130 @@ async function showPaymentDetailsFromButton(
   // Start polling for payment (EVM chains only for now)
   if (['base', 'polygon', 'bnb'].includes(chain)) {
     startPolling(paymentId, chain, walletAddress, product.price);
+  }
+}
+
+async function showFiatPayment(
+  interaction: ButtonInteraction,
+  product: Product,
+  chain: string,
+  serverId: string,
+  walletAddress: string,
+  server: ServerConfig
+) {
+  // Create payment session
+  const { paymentId, expiresAt } = createPaymentSession(
+    interaction.user.id,
+    serverId,
+    product,
+    chain
+  );
+  
+  const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
+  const onrampUrl = buildOnrampUrl(walletAddress, fiatPrice, chain, paymentId);
+  
+  const embed = new EmbedBuilder()
+    .setTitle(`💳 Pay with Card`)
+    .setColor(COLORS.PRIMARY)
+    .setDescription(`Complete your payment on Coinbase:\n\n**Amount:** $${fiatPrice.toFixed(2)} USD\n**You'll receive:** ${product.name}`)
+    .addFields(
+      { name: 'Chain', value: CHAIN_NAMES[chain] || chain.toUpperCase(), inline: true },
+      { name: 'Expires', value: `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>`, inline: true }
+    )
+    .addFields({
+      name: '📝 Instructions',
+      value: '1. Click the button below\n2. Complete payment on Coinbase\n3. Return here - we\'ll detect your payment automatically!'
+    })
+    .setFooter({ text: `Payment ID: ${paymentId}` });
+  
+  const row = new ActionRowBuilder<ButtonBuilder>()
+    .addComponents(
+      new ButtonBuilder()
+        .setLabel('Complete Payment on Coinbase')
+        .setEmoji('💳')
+        .setStyle(ButtonStyle.Link)
+        .setURL(onrampUrl)
+    );
+  
+  await interaction.update({ 
+    embeds: [embed], 
+    components: [row]
+  });
+  
+  // Start polling for payment
+  if (['base', 'polygon', 'bnb'].includes(chain)) {
+    startPolling(paymentId, chain, walletAddress, product.price);
+  }
+}
+
+async function showPaymentDetailsFromButton(
+  interaction: ButtonInteraction,
+  product: Product,
+  chain: string,
+  serverId: string
+) {
+  const server = getServer(serverId);
+  const walletAddress = getServerWalletForChain(serverId, chain);
+  if (!walletAddress) {
+    await interaction.update({ 
+      content: `❌ No wallet configured for ${chain}. Please contact server admin.`,
+      embeds: [],
+      components: []
+    });
+    return;
+  }
+  
+  // Show payment method selection if onramp is supported
+  if (server && isOnrampSupported(chain)) {
+    const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
+    const markupPercent = Math.round(server.fiatMarkup * 100);
+    
+    const embed = new EmbedBuilder()
+      .setTitle(`🛒 ${product.name}`)
+      .setColor(COLORS.PRIMARY)
+      .setDescription('Choose your payment method:')
+      .addFields(
+        { name: 'Chain', value: CHAIN_NAMES[chain] || chain.toUpperCase(), inline: true }
+      );
+    
+    if (product.type === 'role' && product.discordRoleId) {
+      embed.addFields({ name: 'You\'ll receive', value: `<@&${product.discordRoleId}>`, inline: true });
+    }
+    
+    embed.setFooter({ text: `Card payments include a ${markupPercent}% processing fee` });
+    
+    const row = new ActionRowBuilder<ButtonBuilder>()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(`pay_usdc_${product.id}_${chain}`)
+          .setLabel(`💎 Pay with USDC - $${product.price.toFixed(2)}`)
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`pay_fiat_${product.id}_${chain}`)
+          .setLabel(`💳 Pay with Card - $${fiatPrice.toFixed(2)}`)
+          .setStyle(ButtonStyle.Secondary)
+      );
+    
+    const response = await interaction.update({ embeds: [embed], components: [row] });
+    
+    // Wait for payment method selection
+    try {
+      const buttonInteraction = await interaction.message.awaitMessageComponent({
+        componentType: ComponentType.Button,
+        time: 120_000
+      });
+      
+      await handlePaymentMethodSelection(buttonInteraction as ButtonInteraction, product, chain, serverId, server);
+    } catch (error) {
+      await interaction.editReply({
+        content: '⏰ Selection timed out. Run `/buy` again to try.',
+        embeds: [],
+        components: []
+      });
+    }
+  } else {
+    // Direct to USDC payment
+    await showUsdcPaymentFromButton(interaction, product, chain, serverId, walletAddress);
   }
 }
 

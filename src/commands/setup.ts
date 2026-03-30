@@ -8,7 +8,7 @@ import {
   EmbedBuilder,
   PermissionsBitField
 } from 'discord.js';
-import { upsertServerWallet, getServer } from '../services/database';
+import { upsertServerWallet, getServer, setServerFiatMarkup } from '../services/database';
 import { detectWalletType, formatWalletType, getChainsForWalletType } from '../utils/wallet';
 import { COLORS } from '../utils/embeds';
 
@@ -31,6 +31,19 @@ export const data = new SlashCommandBuilder()
     subcommand
       .setName('status')
       .setDescription('Check current setup status')
+  )
+  .addSubcommand(subcommand =>
+    subcommand
+      .setName('fiat-markup')
+      .setDescription('Set markup percentage for card payments (to cover processing fees)')
+      .addNumberOption(option =>
+        option
+          .setName('percent')
+          .setDescription('Markup percentage (e.g., 5 for 5%). Set to 0 to disable card payments.')
+          .setRequired(true)
+          .setMinValue(0)
+          .setMaxValue(50)
+      )
   );
 
 export async function execute(interaction: ChatInputCommandInteraction) {
@@ -40,6 +53,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     await setupWallet(interaction);
   } else if (subcommand === 'status') {
     await showStatus(interaction);
+  } else if (subcommand === 'fiat-markup') {
+    await setupFiatMarkup(interaction);
   }
 }
 
@@ -180,8 +195,59 @@ async function showStatus(interaction: ChatInputCommandInteraction) {
   
   embed.addFields(
     { name: 'Default Chain', value: server.defaultChain, inline: true },
-    { name: 'Connected Since', value: server.createdAt.toLocaleDateString(), inline: true }
+    { name: 'Connected Since', value: server.createdAt.toLocaleDateString(), inline: true },
+    { name: 'Card Payment Markup', value: `${Math.round(server.fiatMarkup * 100)}%`, inline: true }
   );
+  
+  embed.setFooter({ text: 'MoltsPay • Server Monetization' });
+  
+  await interaction.reply({ embeds: [embed], ephemeral: true });
+}
+
+async function setupFiatMarkup(interaction: ChatInputCommandInteraction) {
+  const serverId = interaction.guildId;
+  
+  if (!serverId) {
+    await interaction.reply({ content: '❌ This command can only be used in a server.', ephemeral: true });
+    return;
+  }
+  
+  const server = getServer(serverId);
+  if (!server) {
+    await interaction.reply({ 
+      content: '❌ Server not set up yet. Run `/setup wallet` first.', 
+      ephemeral: true 
+    });
+    return;
+  }
+  
+  const percent = interaction.options.getNumber('percent', true);
+  const markup = percent / 100; // Convert 5 to 0.05
+  
+  setServerFiatMarkup(serverId, markup);
+  
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.SUCCESS);
+  
+  if (percent === 0) {
+    embed.setTitle('💳 Card Payments Disabled')
+      .setDescription('Users will only see the "Pay with USDC" option.')
+      .addFields({
+        name: 'To re-enable',
+        value: 'Run `/setup fiat-markup <percent>` with a value > 0'
+      });
+  } else {
+    embed.setTitle('✅ Card Payment Markup Set')
+      .setDescription(`Users can now pay with credit/debit cards via Coinbase.`)
+      .addFields(
+        { name: 'Markup', value: `${percent}%`, inline: true },
+        { name: 'Example', value: `$10.00 product → $${(10 * (1 + markup)).toFixed(2)} with card`, inline: true }
+      )
+      .addFields({
+        name: '💡 Recommendation',
+        value: 'Coinbase charges ~3% for card payments. A 5% markup covers fees with a small buffer.'
+      });
+  }
   
   embed.setFooter({ text: 'MoltsPay • Server Monetization' });
   
