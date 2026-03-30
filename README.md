@@ -8,6 +8,9 @@ Server monetization with crypto payments. Sell roles, premium channels, and digi
 - **Monthly/Yearly Subscriptions** - Recurring access with automatic expiration
 - **Premium Channels** - Gate content behind paid roles
 - **Crypto Payments** - Accept USDC on Base, Polygon, BNB, Solana
+- **Card Payments** - Credit/debit via Coinbase Onramp with configurable markup
+- **One-Tap Payments** - Deep links to MetaMask, Coinbase Wallet, Trust, Phantom, Solflare
+- **Multi-Chain Selection** - Users choose which blockchain to pay on
 - **Bot Wallets** - Optional in-Discord wallets for seamless payments
 - **External Wallets** - Support MetaMask, Coinbase Wallet, etc.
 - **Automated Expiry** - Cron job removes expired roles, sends reminders
@@ -93,6 +96,7 @@ npm start
 |---------|-------------|
 | `/setup wallet <address>` | Set receiving wallet (auto-detects EVM/Solana) |
 | `/setup status` | Check current setup |
+| `/setup fiat-markup <percent>` | Set card payment markup (0 to disable cards) |
 | `/product create <name> <price> <role> [chain] [billing]` | Create a product (billing: one_time/monthly/yearly) |
 | `/product list` | List all products |
 | `/product edit <id> <field> <value>` | Edit a product |
@@ -119,21 +123,60 @@ npm start
 | `/balance` | Check wallet balance |
 | `/fund` | Get wallet address for deposits |
 
+## Payment Methods
+
+### 💎 USDC Payments
+
+Users can pay directly with USDC from their crypto wallet. The bot provides **one-tap payment links** for popular wallets:
+
+| Wallet | Chains Supported | Features |
+|--------|------------------|----------|
+| MetaMask 🦊 | Base, Polygon, BNB | Mobile + Web links |
+| Coinbase Wallet 📘 | Base, Polygon, BNB | Mobile + Web links |
+| Trust Wallet 🛡️ | Base, Polygon, BNB | Mobile link |
+| Phantom 👻 | Solana | Mobile + Web links |
+| Solflare 🔆 | Solana | Mobile + Web links |
+
+**How it works:**
+1. User clicks `/buy <product>`
+2. Selects chain (if multiple available)
+3. Clicks wallet button (amount pre-filled!)
+4. Confirms in wallet
+5. Bot detects payment and assigns role
+
+### 💳 Card Payments (Coinbase Onramp)
+
+Users without crypto can pay with credit/debit card via Coinbase:
+
+1. Configure markup: `/setup fiat-markup 5` (5% to cover fees)
+2. Users see both options: "Pay with USDC $10" or "Pay with Card $10.50"
+3. Card payments redirect to Coinbase for secure processing
+4. USDC is purchased and sent to your wallet
+5. Bot detects payment and fulfills order
+
+**Supported chains for card payments:** Base, Polygon
+
+**Recommended markup:** 5% (Coinbase charges ~3% for cards)
+
 ## How It Works
 
 1. **Server Owner Setup**
    - Run `/setup wallet 0xYourWallet...`
+   - Set card markup: `/setup fiat-markup 5`
    - Create one-time product: `/product create "VIP" 50.00 @VIPRole`
    - Create subscription: `/product create "VIP Monthly" 5.00 @VIPRole billing:monthly`
 
-2. **User Purchase**
+2. **User Purchase Flow**
    - User runs `/buy VIP Monthly`
-   - Chooses payment method (external wallet or bot wallet)
-   - Completes USDC payment
-   - Bot automatically assigns the role
+   - If product supports multiple chains: selects chain
+   - Chooses payment method (USDC or Card)
+   - **USDC:** Taps wallet button, amount pre-filled
+   - **Card:** Redirects to Coinbase, pays with card
+   - Bot automatically detects payment and assigns role
 
 3. **Payment Verification**
-   - On-chain polling or webhook confirms payment
+   - EVM chains: On-chain polling detects transfers
+   - Webhook support for instant confirmation
    - Bot fulfills order (assigns role, creates subscription)
    - User receives confirmation DM
 
@@ -148,15 +191,24 @@ npm start
 ```
 Discord User
      │
-     ▼
-Discord Bot (discord.js)
-     │
-     ├─► SQLite Database (local storage)
-     │
-     └─► MoltsPay API (payment processing)
-            │
-            ▼
-       Blockchain (Base/USDC)
+     ├─► /buy → Chain Selection → Payment Method
+     │           │                      │
+     │           ▼                      ▼
+     │    USDC Deep Links         Coinbase Onramp
+     │    (MetaMask/Phantom)      (Card → USDC)
+     │           │                      │
+     │           └──────────┬──────────┘
+     │                      ▼
+     │              Blockchain (USDC)
+     │                      │
+     │                      ▼
+     │              Payment Poller
+     │                      │
+     │                      ▼
+     └─► Fulfillment (Role Assignment)
+                    │
+                    ▼
+            SQLite Database
 ```
 
 ## Development
@@ -207,6 +259,35 @@ The bot auto-detects wallet type from the address format:
 ```
 
 Run the command twice (once for each address type) to accept payments on all chains.
+
+## Card Payments Setup
+
+### Enable Card Payments
+
+```bash
+# Set 5% markup (recommended)
+/setup fiat-markup 5
+
+# Check status
+/setup status
+# → Card Payment Markup: 5%
+```
+
+### Disable Card Payments
+
+```bash
+/setup fiat-markup 0
+```
+
+### How Markup Works
+
+| Base Price | Markup | Card Price | Your Revenue |
+|------------|--------|------------|--------------|
+| $10.00 | 5% | $10.50 | ~$10.18* |
+| $50.00 | 5% | $52.50 | ~$50.93* |
+| $100.00 | 5% | $105.00 | ~$101.85* |
+
+*After Coinbase's ~3% fee
 
 ## Security
 
@@ -274,6 +355,27 @@ Admins can manually trigger with `/admin expire-check`.
 # Extend a subscription
 /admin extend @username VIP-Monthly 30
 ```
+
+## Wallet Deep Links
+
+The bot generates direct payment links with pre-filled amounts:
+
+### EVM Chains (Base, Polygon, BNB)
+
+| Wallet | Mobile | Web |
+|--------|--------|-----|
+| MetaMask | ✅ app.link | ✅ portfolio.metamask.io |
+| Coinbase | ✅ go.cb-w.com | ✅ wallet.coinbase.com |
+| Trust Wallet | ✅ link.trustwallet.com | ❌ |
+
+### Solana
+
+| Wallet | Mobile | Web |
+|--------|--------|-----|
+| Phantom | ✅ phantom.app/ul | ✅ phantom.app/ul |
+| Solflare | ✅ solflare.com/ul | ✅ solflare.com/ul |
+
+**Note:** Amount auto-fills on mobile. Desktop users may need to enter amount manually.
 
 ## License
 
