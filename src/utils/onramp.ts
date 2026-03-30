@@ -1,5 +1,8 @@
 /**
  * Coinbase Onramp URL Builder
+ * 
+ * Requires COINBASE_ONRAMP_APP_ID from CDP Portal:
+ * https://portal.cdp.coinbase.com → Create Project → Enable Onramp
  */
 
 // Chain to Coinbase network mapping
@@ -18,6 +21,11 @@ export function buildOnrampUrl(
   chain: string,
   paymentId: string
 ): string {
+  const appId = process.env.COINBASE_ONRAMP_APP_ID;
+  if (!appId) {
+    console.warn('⚠️ COINBASE_ONRAMP_APP_ID not set - onramp may not work');
+  }
+  
   const network = CHAIN_TO_NETWORK[chain] || 'base';
   
   const destinationWallets = [{
@@ -27,8 +35,6 @@ export function buildOnrampUrl(
   }];
   
   const params = new URLSearchParams({
-    // Destination wallet config
-    destinationWallets: JSON.stringify(destinationWallets),
     // Pre-fill amount
     presetFiatAmount: fiatAmount.toFixed(2),
     fiatCurrency: 'USD',
@@ -38,6 +44,14 @@ export function buildOnrampUrl(
     // Reference for tracking (will show in transaction)
     partnerUserId: paymentId
   });
+  
+  // Add appId if configured
+  if (appId) {
+    params.set('appId', appId);
+  }
+  
+  // Add destination wallets
+  params.set('destinationWallets', JSON.stringify(destinationWallets));
   
   return `https://pay.coinbase.com/buy/select-asset?${params.toString()}`;
 }
@@ -54,4 +68,11 @@ export function calculateFiatPrice(basePrice: number, markupPercent: number): nu
  */
 export function isOnrampSupported(chain: string): boolean {
   return chain in CHAIN_TO_NETWORK;
+}
+
+/**
+ * Filter chains to only those that support onramp
+ */
+export function getOnrampChains(chains: string[]): string[] {
+  return chains.filter(chain => isOnrampSupported(chain));
 }
