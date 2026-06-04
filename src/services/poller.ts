@@ -30,6 +30,20 @@ const MAX_POLLS = 90; // 15 minutes total (90 × 10s = 900s)
 // Active polling sessions
 const activePollers: Map<string, NodeJS.Timeout> = new Map();
 
+// Cached JsonRpcProvider per chain. Creating a new provider on every
+// startPolling leaks: each one spins up its own background block-polling loop
+// that is never torn down. Reuse a single long-lived provider per chain.
+const providerCache: Map<string, ethers.JsonRpcProvider> = new Map();
+
+function getProvider(chain: string, rpcUrl: string): ethers.JsonRpcProvider {
+  let provider = providerCache.get(chain);
+  if (!provider) {
+    provider = new ethers.JsonRpcProvider(rpcUrl);
+    providerCache.set(chain, provider);
+  }
+  return provider;
+}
+
 // Callbacks for payment events
 type PaymentCallback = (paymentId: string, txHash: string) => void;
 let onPaymentConfirmed: PaymentCallback | null = null;
@@ -65,7 +79,7 @@ export async function startPolling(
     return;
   }
 
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const provider = getProvider(chain, rpcUrl);
   const startBlock = await provider.getBlockNumber();
   let pollCount = 0;
 

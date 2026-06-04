@@ -218,6 +218,28 @@ app.get('/health', (req, res) => {
 
 const webhookPort = process.env.WEBHOOK_PORT || 3402;
 
+// Periodic memory monitor — logs RSS/heap every 5 minutes so we can spot the
+// memory leak (heap creeping toward the --max-old-space-size cap) before OOM.
+const MEMORY_LOG_INTERVAL_MS = 5 * 60 * 1000;
+function startMemoryMonitor() {
+  const log = () => {
+    const m = process.memoryUsage();
+    const mb = (n: number) => Math.round(n / 1024 / 1024);
+    let pollers = 0;
+    try {
+      // Lazily required to avoid import cycles; surfaces poller leaks too.
+      pollers = require('./services/poller').getActivePollingCount?.() ?? 0;
+    } catch { /* ignore */ }
+    console.log(
+      `[Memory] ${new Date().toISOString()} rss=${mb(m.rss)}MB heapUsed=${mb(m.heapUsed)}MB ` +
+      `heapTotal=${mb(m.heapTotal)}MB external=${mb(m.external)}MB activePollers=${pollers}`
+    );
+  };
+  log();
+  const timer = setInterval(log, MEMORY_LOG_INTERVAL_MS);
+  timer.unref?.();
+}
+
 // Start both services
 async function main() {
   try {
@@ -228,6 +250,9 @@ async function main() {
     
     // Login to Discord
     await client.login(process.env.DISCORD_TOKEN);
+
+    // Start memory monitoring
+    startMemoryMonitor();
   } catch (error) {
     console.error('Failed to start bot:', error);
     process.exit(1);
