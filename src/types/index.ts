@@ -9,6 +9,10 @@ export interface ServerConfig {
   solanaWallet: string | null;
   defaultChain: string;
   fiatMarkup: number;
+  // Alipay config (1.7.0)
+  alipayEnabled: boolean;
+  alipaySellerId?: string;
+  alipayServiceEndpoint?: string;  // moltspay server endpoint for alipay 402
   createdAt: Date;
 }
 
@@ -16,6 +20,12 @@ export interface ServerConfig {
 export type ProductType = 'role' | 'channel' | 'service' | 'digital' | 'custom';
 export type BillingType = 'one_time' | 'subscription';
 export type BillingPeriod = 'monthly' | 'yearly';
+
+export interface ProductAlipayConfig {
+  serviceId?: string;    // alipay service_id (optional, uses server default)
+  priceCny: string;     // CNY price string, e.g. "7.00"
+  goodsName: string;    // Product name shown in Alipay app
+}
 
 export interface Product {
   id: string;
@@ -25,6 +35,9 @@ export interface Product {
   price: number;
   currency: string;
   chains: string[];  // Multiple chains supported
+  
+  // Alipay config (1.7.0)
+  alipay?: ProductAlipayConfig;
   
   // Type-specific fields
   discordRoleId?: string;

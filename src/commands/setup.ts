@@ -59,7 +59,9 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 }
 
 async function setupWallet(interaction: ChatInputCommandInteraction) {
-  const address = interaction.options.getString('address', true).trim();
+  // Clean address: trim whitespace and remove invisible unicode characters (Android clipboard issue)
+  const rawAddress = interaction.options.getString('address', true);
+  const address = rawAddress.trim().replace(/[^\x20-\x7E]/g, '');
   const serverId = interaction.guildId;
   
   if (!serverId) {

@@ -69,6 +69,26 @@ function runMigrations(): void {
     if (!hasPaymentMethod && paymentCols.length > 0) {
       db.exec(`ALTER TABLE payments ADD COLUMN payment_method TEXT DEFAULT 'usdc'`);
     }
+    
+    // Migration: Add alipay fields to servers (1.7.0)
+    const hasAlipayEnabled = serverCols.some(c => c.name === 'alipay_enabled');
+    if (!hasAlipayEnabled && serverCols.length > 0) {
+      db.exec(`
+        ALTER TABLE servers ADD COLUMN alipay_enabled INTEGER DEFAULT 0;
+        ALTER TABLE servers ADD COLUMN alipay_seller_id TEXT;
+        ALTER TABLE servers ADD COLUMN alipay_service_endpoint TEXT;
+      `);
+    }
+    
+    // Migration: Add alipay fields to products (1.7.0)
+    const hasAlipayPriceCny = productCols.some(c => c.name === 'alipay_price_cny');
+    if (!hasAlipayPriceCny && productCols.length > 0) {
+      db.exec(`
+        ALTER TABLE products ADD COLUMN alipay_price_cny TEXT;
+        ALTER TABLE products ADD COLUMN alipay_goods_name TEXT;
+        ALTER TABLE products ADD COLUMN alipay_service_id TEXT;
+      `);
+    }
   } catch (e) {
     // Tables don't exist yet, will be created below
   }
@@ -82,6 +102,9 @@ function runMigrations(): void {
       solana_wallet TEXT,
       default_chain TEXT DEFAULT 'base',
       fiat_markup REAL DEFAULT 0.05,
+      alipay_enabled INTEGER DEFAULT 0,
+      alipay_seller_id TEXT,
+      alipay_service_endpoint TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -101,6 +124,9 @@ function runMigrations(): void {
       webhook_url TEXT,
       billing_type TEXT DEFAULT 'one_time',
       billing_period TEXT,
+      alipay_price_cny TEXT,
+      alipay_goods_name TEXT,
+      alipay_service_id TEXT,
       active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (server_id) REFERENCES servers(server_id)
@@ -182,6 +208,9 @@ export function getServer(serverId: string): ServerConfig | null {
     solanaWallet: row.solana_wallet,
     defaultChain: row.default_chain,
     fiatMarkup: row.fiat_markup ?? 0.05,
+    alipayEnabled: !!(row.alipay_enabled),
+    alipaySellerId: row.alipay_seller_id ?? undefined,
+    alipayServiceEndpoint: row.alipay_service_endpoint ?? undefined,
     createdAt: new Date(row.created_at)
   };
 }
@@ -323,6 +352,11 @@ function mapProduct(row: any): Product {
     price: row.price,
     currency: row.currency,
     chains,
+    alipay: row.alipay_price_cny ? {
+      priceCny: row.alipay_price_cny,
+      goodsName: row.alipay_goods_name || row.name,
+      serviceId: row.alipay_service_id || undefined,
+    } : undefined,
     discordRoleId: row.discord_role_id,
     serviceEndpoint: row.service_endpoint,
     fileUrl: row.file_url,

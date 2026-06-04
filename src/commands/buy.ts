@@ -2,9 +2,10 @@
  * /buy - Purchase a product
  * 
  * Flow: Payment Method First
- * 1. /buy → Payment Method (USDC/Card)
+ * 1. /buy → Payment Method (USDC/Card/Alipay)
  * 2. Card → Auto-select Base → Coinbase Onramp
  * 3. USDC → Chain selection → Wallet deep links
+ * 4. Alipay → alipay-bot → Payment link → Poll status
  */
 
 import { 
@@ -14,16 +15,20 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  ComponentType
+  ComponentType,
+  AttachmentBuilder
 } from 'discord.js';
 import type { ButtonInteraction } from 'discord.js';
-import { 
-  getServerProducts, 
+import {
+  getServerProducts,
   getProductByName,
   getServer,
-  getServerWalletForChain
+  getServerWalletForChain,
+  getPayment
 } from '../services/database';
 import { createPaymentSession } from '../services/payment';
+import { createAlipayPayment, startAlipayPolling } from '../services/alipay';
+import { fulfill } from '../services/fulfillment';
 import { startPolling } from '../services/poller';
 import { COLORS, productListEmbed } from '../utils/embeds';
 import { getWalletLinks } from '../utils/deeplinks';
@@ -107,12 +112,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
   }
   
-  // NEW FLOW: Payment method selection first
+  // Payment method selection
   await showPaymentMethodSelection(interaction, product, serverId, server);
 }
 
 /**
- * Step 1: Show payment method selection (USDC or Card)
+ * Step 1: Show payment method selection (USDC / Card / Alipay)
  */
 async function showPaymentMethodSelection(
   interaction: ChatInputCommandInteraction,
@@ -121,11 +126,11 @@ async function showPaymentMethodSelection(
   server: ServerConfig
 ) {
   // Check if card payments are available
-  // Requirements: onramp-supported chain + markup > 0 + minimum $5 (Coinbase requirement)
   const onrampChains = getOnrampChains(product.chains);
   const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
   const MINIMUM_FIAT_AMOUNT = 5;
   const hasCardOption = onrampChains.length > 0 && server.fiatMarkup > 0 && fiatPrice >= MINIMUM_FIAT_AMOUNT;
+  const hasAlipayOption = server.alipayEnabled && product.alipay;
   const markupPercent = Math.round(server.fiatMarkup * 100);
   
   const embed = new EmbedBuilder()
@@ -133,7 +138,7 @@ async function showPaymentMethodSelection(
     .setColor(COLORS.PRIMARY)
     .setDescription('Choose your payment method:')
     .addFields(
-      { name: 'Price', value: `$${product.price.toFixed(2)} USDC`, inline: true }
+      { name: 'Price', value: `$${product.price.toFixed(2)} USDC${hasAlipayOption ? ` / ¥${product.alipay!.priceCny} CNY` : ''}`, inline: true }
     );
   
   if (product.type === 'role' && product.discordRoleId) {
@@ -150,7 +155,7 @@ async function showPaymentMethodSelection(
   row.addComponents(
     new ButtonBuilder()
       .setCustomId(`method_usdc_${product.id}`)
-      .setLabel(`💎 Pay with USDC - $${product.price.toFixed(2)}`)
+      .setLabel(`💎 USDC - $${product.price.toFixed(2)}`)
       .setStyle(ButtonStyle.Primary)
   );
   
@@ -159,13 +164,25 @@ async function showPaymentMethodSelection(
     row.addComponents(
       new ButtonBuilder()
         .setCustomId(`method_card_${product.id}`)
-        .setLabel(`💳 Pay with Card - $${fiatPrice.toFixed(2)}`)
+        .setLabel(`💳 Card - $${fiatPrice.toFixed(2)}`)
         .setStyle(ButtonStyle.Secondary)
     );
-    embed.setFooter({ text: `Card payments include a ${markupPercent}% processing fee` });
-  } else {
-    embed.setFooter({ text: 'Pay with any crypto wallet' });
   }
+
+  // Alipay button (only if server has alipay enabled and product has alipay config)
+  if (hasAlipayOption) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`method_alipay_${product.id}`)
+        .setLabel(`🅰️ 支付宝 - ¥${product.alipay!.priceCny}`)
+        .setStyle(ButtonStyle.Success)
+    );
+  }
+
+  const footer = [];
+  if (hasCardOption) footer.push(`Card: +${markupPercent}% fee`);
+  if (hasAlipayOption) footer.push('Alipay: CNY via 支付宝AI收');
+  embed.setFooter({ text: footer.join(' | ') || 'Pay with any crypto wallet' });
   
   await interaction.reply({ 
     embeds: [embed], 
@@ -173,10 +190,8 @@ async function showPaymentMethodSelection(
     ephemeral: true 
   });
   
-  // Get the reply message for collector
   const message = await interaction.fetchReply();
   
-  // Use collector for button handling
   const collector = message.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: 120_000,
@@ -191,6 +206,8 @@ async function showPaymentMethodSelection(
         await showChainSelection(buttonInteraction, product, serverId);
       } else if (method === 'card') {
         await showCardPayment(buttonInteraction, product, serverId, server);
+      } else if (method === 'alipay') {
+        await showAlipayPayment(buttonInteraction, product, serverId, server);
       }
     } catch (error) {
       console.error('[Buy] Error handling button:', error);
@@ -216,10 +233,8 @@ async function showChainSelection(
   product: Product, 
   serverId: string
 ) {
-  // Acknowledge immediately to prevent Discord timeout
   await interaction.deferUpdate();
   
-  // If only one chain, skip selection
   if (product.chains.length === 1) {
     const chain = product.chains[0];
     const walletAddress = getServerWalletForChain(serverId, chain);
@@ -249,7 +264,6 @@ async function showChainSelection(
   
   embed.setFooter({ text: 'Choose your preferred payment chain' });
   
-  // Build chain selection buttons
   const row = new ActionRowBuilder<ButtonBuilder>();
   
   for (const chain of product.chains) {
@@ -266,7 +280,6 @@ async function showChainSelection(
     components: [row]
   });
   
-  // Wait for chain selection
   try {
     const buttonInteraction = await message.awaitMessageComponent({
       componentType: ComponentType.Button,
@@ -304,10 +317,8 @@ async function showCardPayment(
   serverId: string,
   server: ServerConfig
 ) {
-  // Defer immediately - CDP API call can take several seconds
   await interaction.deferUpdate();
   
-  // Auto-select best chain for onramp (prefer Base)
   const onrampChains = getOnrampChains(product.chains);
   const chain = onrampChains.includes('base') ? 'base' : onrampChains[0];
   
@@ -321,7 +332,6 @@ async function showCardPayment(
     return;
   }
   
-  // Create payment session
   const { paymentId, expiresAt } = createPaymentSession(
     interaction.user.id,
     serverId,
@@ -331,7 +341,6 @@ async function showCardPayment(
   
   const fiatPrice = calculateFiatPrice(product.price, server.fiatMarkup);
   
-  // Get onramp URL (requires CDP API call - this is slow)
   let onrampUrl: string;
   try {
     onrampUrl = await buildOnrampUrl(walletAddress, fiatPrice, chain, paymentId);
@@ -373,9 +382,169 @@ async function showCardPayment(
     components: [row]
   });
   
-  // Start polling for payment
   if (['base', 'polygon', 'bnb'].includes(chain)) {
     startPolling(paymentId, chain, walletAddress, product.price);
+  }
+}
+
+/**
+ * Step 2c (Alipay path): Generate payment link via alipay-bot
+ */
+async function showAlipayPayment(
+  interaction: ButtonInteraction,
+  product: Product,
+  serverId: string,
+  server: ServerConfig
+) {
+  await interaction.deferUpdate();
+
+  if (!product.alipay || !server.alipayServiceEndpoint) {
+    await interaction.editReply({
+      content: '❌ Alipay payment is not configured for this product or server.',
+      embeds: [],
+      components: [],
+    });
+    return;
+  }
+
+  // Show "processing" message
+  const processingEmbed = new EmbedBuilder()
+    .setTitle(`🅰️ 支付宝支付`)
+    .setColor(COLORS.PRIMARY)
+    .setDescription('⏳ 正在生成支付链接，请稍候...')
+    .setFooter({ text: 'Alipay AI 收' });
+
+  await interaction.editReply({
+    embeds: [processingEmbed],
+    components: [],
+  });
+
+  try {
+    const result = await createAlipayPayment(
+      interaction.user.id,
+      serverId,
+      product,
+      server.alipayServiceEndpoint,
+      product.alipay.priceCny,
+    );
+
+    const embed = new EmbedBuilder()
+      .setTitle(`🅰️ 支付宝支付 - ${product.name}`)
+      .setColor(COLORS.PRIMARY)
+      .setDescription(`请使用支付宝扫描下方二维码完成支付`)
+      .addFields(
+        { name: '金额', value: `¥${product.alipay.priceCny} CNY`, inline: true },
+        { name: '商品', value: product.alipay.goodsName, inline: true },
+        { name: '有效期', value: `<t:${Math.floor(result.expiresAt.getTime() / 1000)}:R>`, inline: true },
+      )
+      .setFooter({ text: `Payment ID: ${result.paymentId} | TradeNo: ${result.tradeNo}` });
+
+    // Attach qrcode image if available
+    if (result.qrcodePath) {
+      const qrAttachment = new AttachmentBuilder(result.qrcodePath, { name: 'qrcode.png' });
+      embed.setImage('attachment://qrcode.png');
+      embed.addFields({
+        name: '📝 支付步骤',
+        value: '1. 打开支付宝APP\n2. 扫描上方二维码\n3. 确认支付',
+      });
+
+      const replyOptions: any = {
+        embeds: [embed],
+        files: [qrAttachment],
+        components: [],
+      };
+
+      // Add mobile button only if we have a valid payment URL
+      if (result.shortenUrl || result.paymentUrl) {
+        const row = new ActionRowBuilder<ButtonBuilder>()
+          .addComponents(
+            new ButtonBuilder()
+              .setLabel('📱 手机打开支付宝')
+              .setStyle(ButtonStyle.Link)
+              .setURL(result.shortenUrl || result.paymentUrl!),
+          );
+        replyOptions.components = [row];
+      }
+
+      await interaction.editReply(replyOptions);
+    } else {
+      // No qrcode, fall back to link only
+      embed.addFields({
+        name: '📝 支付步骤',
+        value: '1. 点击下方按钮打开支付页面\n2. 用支付宝扫码或确认支付\n3. 支付完成后自动检测',
+      });
+
+      const row = new ActionRowBuilder<ButtonBuilder>()
+        .addComponents(
+          new ButtonBuilder()
+            .setLabel('📱 手机打开支付宝')
+            .setStyle(ButtonStyle.Link)
+            .setURL(result.shortenUrl || result.paymentUrl!),
+        );
+
+      await interaction.editReply({
+        embeds: [embed],
+        components: [row],
+      });
+    }
+
+    // Start polling for alipay payment
+    startAlipayPolling(
+      result.paymentId,
+      result.tradeNo,
+      server.alipayServiceEndpoint,
+      // onPaid callback
+      async (paymentId: string, tradeNo: string) => {
+        // Fulfill the order (assign role / deliver digital / webhook), same as
+        // the EVM path. Without this an Alipay role purchase never grants the role.
+        let fulfillMessage = '';
+        try {
+          const payment = getPayment(paymentId);
+          if (payment) {
+            const result = await fulfill(interaction.client, payment, product);
+            console.log(`[Alipay] Fulfillment result for ${paymentId}:`, result);
+            fulfillMessage = result.success
+              ? ''
+              : `\n⚠️ 履约失败：${result.message}。请联系管理员并提供 Payment ID: \`${paymentId}\``;
+          }
+        } catch (err) {
+          console.error('[Alipay] Fulfillment failed:', err);
+          fulfillMessage = `\n⚠️ 履约异常，请联系管理员并提供 Payment ID: \`${paymentId}\``;
+        }
+
+        try {
+          const channel = interaction.channel;
+          if (channel && channel.isSendable()) {
+            await channel.send({
+              content: `✅ <@${interaction.user.id}> 支付成功！交易号: \`${tradeNo}\`\n\n商品 **${product.name}** 已购买成功！${fulfillMessage}`,
+            });
+          }
+        } catch (err) {
+          console.error('[Alipay] Failed to send payment confirmation:', err);
+        }
+      },
+      // onExpired callback
+      async (paymentId: string) => {
+        try {
+          const channel = interaction.channel;
+          if (channel && channel.isSendable()) {
+            await channel.send({
+              content: `⏰ <@${interaction.user.id}> 支付超时，支付已取消。请重新使用 \`/buy\` 发起支付。`,
+            });
+          }
+        } catch (err) {
+          console.error('[Alipay] Failed to send expiry notice:', err);
+        }
+      },
+    );
+  } catch (error) {
+    console.error('[Alipay] Payment creation failed:', error);
+    const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+    await interaction.editReply({
+      content: `❌ 支付宝支付创建失败：${errorMsg}`,
+      embeds: [],
+      components: [],
+    });
   }
 }
 
@@ -389,7 +558,6 @@ async function showUsdcPayment(
   serverId: string,
   walletAddress: string
 ) {
-  // Create payment session with unique amount
   const { paymentId, expiresAt, amount } = createPaymentSession(
     interaction.user.id,
     serverId,
@@ -405,7 +573,6 @@ async function showUsdcPayment(
     components: rows
   });
   
-  // Start polling for payment (EVM chains only for now)
   if (['base', 'polygon', 'bnb'].includes(chain)) {
     startPolling(paymentId, chain, walletAddress, amount);
   }
@@ -461,7 +628,6 @@ function buildWalletButtons(
   const walletLinks = getWalletLinks(chain, walletAddress, amountUSDC);
   const rows: ActionRowBuilder<ButtonBuilder>[] = [];
   
-  // Mobile wallet buttons row
   const mobileRow = new ActionRowBuilder<ButtonBuilder>();
   for (const wallet of walletLinks) {
     mobileRow.addComponents(
@@ -473,7 +639,6 @@ function buildWalletButtons(
   }
   rows.push(mobileRow);
   
-  // Web wallet buttons row (only for wallets with web URLs)
   const walletsWithWeb = walletLinks.filter(w => w.webUrl);
   if (walletsWithWeb.length > 0) {
     const webRow = new ActionRowBuilder<ButtonBuilder>();

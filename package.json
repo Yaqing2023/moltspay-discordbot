@@ -22,13 +22,15 @@
   "author": "MoltsPay",
   "license": "MIT",
   "dependencies": {
-    "better-sqlite3": "^11.0.0",
+    "@types/qrcode": "^1.5.6",
+    "better-sqlite3": "^12.10.0",
     "discord-api-types": "^0.38.43",
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.5",
     "ethers": "^6.16.0",
     "express": "^4.19.2",
-    "moltspay": "^0.8.15"
+    "moltspay": "file:../payment-agent/moltspay-1.7.0.tgz",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.10",
