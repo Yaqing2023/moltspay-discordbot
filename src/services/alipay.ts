@@ -60,12 +60,29 @@ interface CliResult {
 /**
  * Run alipay-bot CLI command
  */
-function runCli(args: string[], opts?: { env?: NodeJS.ProcessEnv }): Promise<CliResult> {
+const CLI_DEFAULT_TIMEOUT_MS = 60_000; // per-call hard timeout
+
+function runCli(
+  args: string[],
+  opts?: { env?: NodeJS.ProcessEnv; timeoutMs?: number },
+): Promise<CliResult> {
   return new Promise((resolve, reject) => {
     const lines: string[] = [];
     const child = spawn('alipay-bot', args, {
       env: { ...filterEnv(process.env), ...(opts?.env ?? {}) },
     });
+
+    // Hard timeout: the Alipay gateway (aigw.alipay.com) is slow/flaky, and a
+    // hung CLI call would otherwise leave the Discord "正在生成支付链接" spinner
+    // forever. Kill the child and reject so the caller surfaces an error.
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      reject(new Error(`alipay-bot ${args[0]} timed out after ${opts?.timeoutMs ?? CLI_DEFAULT_TIMEOUT_MS}ms`));
+    }, opts?.timeoutMs ?? CLI_DEFAULT_TIMEOUT_MS);
+    timer.unref?.();
 
     let stdoutBuf = '';
     let stderrBuf = '';
@@ -90,8 +107,18 @@ function runCli(args: string[], opts?: { env?: NodeJS.ProcessEnv }): Promise<Cli
       }
     });
 
-    child.on('error', reject);
-    child.on('close', (code) => resolve({ exitCode: code ?? 1, lines }));
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ exitCode: code ?? 1, lines });
+    });
   });
 }
 
@@ -111,7 +138,15 @@ const WALLET_SETUP_NEEDED = /未开通|未开启|未授权|等待授权|NOT[_\s-
  * it's a flaky network query — so we retry with backoff. Only a genuine
  * "未开通/未授权" response (real user setup needed) fails fast without retry.
  */
+// Cache a successful wallet-ready result. `check-wallet` hits the slow Alipay
+// gateway (10–30s/call), so re-verifying on every /buy makes the spinner drag.
+// Wallet state rarely changes, so a short TTL is safe.
+let walletReadyUntilMs = 0;
+const WALLET_READY_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 async function checkWalletReady(maxRetries = 3): Promise<void> {
+  if (Date.now() < walletReadyUntilMs) return; // recently confirmed ready
+
   let lastMsg = 'no output';
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) await sleep(800 * attempt); // backoff: 0.8s, 1.6s, 2.4s
@@ -127,7 +162,10 @@ async function checkWalletReady(maxRetries = 3): Promise<void> {
       continue; // unparseable → treat as transient, retry
     }
 
-    if (walletJson.code === 200) return; // ready
+    if (walletJson.code === 200) {
+      walletReadyUntilMs = Date.now() + WALLET_READY_TTL_MS; // cache success
+      return; // ready
+    }
 
     lastMsg = walletJson.message || walletText;
     // Genuine setup-needed → no point retrying, surface actionable error.
@@ -210,6 +248,7 @@ export async function createAlipayPayment(
       'Accept-Payment-Rail': 'alipay',
     },
     body: JSON.stringify({ service: product.name, params: {} }),
+    signal: AbortSignal.timeout(30_000), // don't hang on a slow/unreachable endpoint
   });
 
   if (res.status !== 402) {
