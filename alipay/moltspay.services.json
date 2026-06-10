@@ -1,0 +1,66 @@
+{
+  "provider": {
+    "name": "MoltsPay Discord Bot",
+    "description": "Discord 服务器变现 - 支付宝 AI 收银台（角色/会员类商品）",
+    "wallet": "0xb8d6f2441e8f8dfB6288A74Cf73804cDd0484E0C",
+    "solana_wallet": "CNbgcwV95JCguguA652kxwXPhS6EwoskeBPH45o8ow7K",
+    "chains": ["base", "polygon", "bnb", "solana", "alipay"],
+    "alipay": {
+      "seller_id": "2088641494699428",
+      "app_id": "2021006150642142",
+      "seller_name": "上海超响应数字科技有限公司",
+      "service_id_default": "API_0EA6DC4FC99A4DF7",
+      "private_key_path": "/home/juhe0092/clawd/skills/video_gen/cert/ALIPAY_PRIVATE_KEY.txt",
+      "alipay_public_key_path": "/home/juhe0092/clawd/skills/video_gen/cert/ALIPAY_PUBLIC_KEY.txt",
+      "gateway_url": "https://openapi.alipay.com/gateway.do",
+      "sign_type": "RSA2"
+    }
+  },
+  "services": [
+    {
+      "id": "zen7-vip",
+      "name": "Zen7 VIP 会员",
+      "description": "Zen7 VIP 会员（Discord 角色）",
+      "price": 0.01,
+      "currency": "USDC",
+      "alipay": {
+        "price_cny": "35.00",
+        "goods_name": "Zen7 VIP 会员"
+      },
+      "input": {},
+      "output": {
+        "ok": { "type": "boolean", "description": "收银台占位返回；实际履约由 Discord bot 发放角色" }
+      }
+    },
+    {
+      "id": "zen7-subscription",
+      "name": "Zen7 月度订阅",
+      "description": "Zen7 月度订阅（Discord 角色）",
+      "price": 0.01,
+      "currency": "USDC",
+      "alipay": {
+        "price_cny": "0.50",
+        "goods_name": "Zen7 月度订阅"
+      },
+      "input": {},
+      "output": {
+        "ok": { "type": "boolean", "description": "收银台占位返回；实际履约由 Discord bot 发放角色" }
+      }
+    },
+    {
+      "id": "test-video",
+      "name": "测试视频",
+      "description": "测试商品",
+      "price": 0.01,
+      "currency": "USDC",
+      "alipay": {
+        "price_cny": "1.00",
+        "goods_name": "测试视频"
+      },
+      "input": {},
+      "output": {
+        "ok": { "type": "boolean", "description": "收银台占位返回；实际履约由 Discord bot 发放角色" }
+      }
+    }
+  ]
+}

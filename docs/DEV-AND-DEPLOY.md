@@ -421,6 +421,91 @@ https://metamask.app.link/send/{usdc_contract}@8453/transfer?address={recipient}
 
 修复：`buy.ts` 的 alipay `onPaid` 回调现在先 `getPayment(paymentId)` → `fulfill(client, payment, product)` 再发频道消息，与 EVM/Onramp 路径一致；履约失败时在确认消息里附带 Payment ID 提示联系管理员。
 
+### 13.3 支付宝下单报错 `Expected 402, got 404`（service 名不匹配）
+
+**状态：** 代码已迁移到 moltspay SDK（2026-06-05）；端点/商品的 service 对齐仍需按部署环境配置（见下）
+**现象：** Discord `/buy` 选支付宝后报错 `❌ 支付宝支付创建失败：Expected 402, got 404`
+
+**根因（已复现 + 正向验证）：**
+这是**业务层 404**，不是网络/URL/支付宝授权问题。链路本身是通的（`/health`=200，`/execute` 存在，`ping` 能正常返回 402），唯一缺口是 **bot 发送的 service 名 ≠ 402 服务端注册的 service id**。
+
+- 报错位置：`src/services/alipay.ts:254-256`
+  ```ts
+  body: JSON.stringify({ service: product.name, params: {} })   // ← 发的是 Discord 商品名
+  if (res.status !== 402) throw new Error(`Expected 402, got ${res.status}`);
+  ```
+- 402 服务端（`payment-agent`，独立进程，端点 `http://127.0.0.1:8402/execute`）的 `/execute` 逻辑：
+  ```ts
+  const skill = this.skills.get(service);
+  if (!skill) return sendJson(res, 404, { error: `Service '${service}' not found or not registered` });
+  ```
+- 服务端实际注册的 service id（来自 `skills/video_gen/moltspay.services.json`）：`ping` / `text-to-video` / `image-to-video`
+- bot 实际发送的 `service`（= `product.name`）：`zen7-vip` / `zen7-subscription` / `test-video` …
+- 二者完全不匹配 → 服务端返回 404 → bot 断言抛出 `Expected 402, got 404`
+
+复现：
+```
+service='zen7-vip'      -> 404 ❌（bot 实际发的）
+service='test-video'    -> 404 ❌
+service='ping'          -> 402 ✅（服务端真有的名字，带 Payment-Needed 头）
+```
+
+**历史确认：** 此链路**从未端到端跑通过**，非回归。支付宝接入（commit `0d93c18`，2026-06-04）起 `service: product.name` 就没变过；8402 服务端自 2026-06-03 起一直加载 `video_gen` 清单，从未注册过商品名对应的 service。
+
+**架构定性（重要，避免误修）：**
+本 bot（`moltspay-discordbot`）与 8402 上运行的 `payment-agent + video_gen` 是**两套完全独立、互不相关的系统**：
+
+- 本 bot：独立的 Discord 电商，卖自己的商品（会员/角色等），有自己的价格，履约 = 发 Discord 角色。
+- `payment-agent + video_gen`：独立的 x402 服务提供方，卖 AI 视频生成能力（`ping`/`text-to-video`/`image-to-video`），有自己的 service、价格、商户凭证。
+
+两者之间**没有也不应该有**「商品 ↔ service」的所属或映射关系。因此问题的本质是：bot 的 `alipay_service_endpoint` 被错误地指向了**一个不相关系统的端点**（`http://127.0.0.1:8402/execute`），bot 拿自己的商品名去查 video_gen 的 service 表当然 404 —— 这是**接错对象**，不是「缺一层映射」。
+
+> ⚠️ **不要**把 zen7-vip / zen7-subscription 等商品塞进 video_gen 的 manifest。那会把两个独立系统错误耦合，并导致用错商户、收错金额。
+
+**已实施修复（2026-06-05）：迁移到 moltspay SDK**
+确认 `/execute` 端点本就是给本 bot 用的收款入口，集成方式应走官方 SDK，而不是 bot 自己手写 fetch+CLI。已将 `src/services/alipay.ts` 从「手写 402 fetch + `spawn('alipay-bot')` + 自写轮询」整体重写为调用 SDK：
+
+```ts
+import { MoltsPayClient } from 'moltspay';
+const client = new MoltsPayClient({ alipaySessionId: `discord-${paymentId}` });
+await client.pay(serviceEndpoint, service, {}, {
+  rail: 'alipay',
+  timeoutMs: 30 * 60 * 1000,
+  onPaymentPending: (info) => { /* 生成二维码、建 DB 记录、展示 */ },
+});
+// pay() resolve → 支付成功 → fulfill()；reject(在 onPending 前) → "创建失败"
+```
+
+- 对外 API：`alipay.ts` 现导出 `startAlipayPayment(userId, serverId, product, endpoint, priceCny, { onPending, onPaid, onFailed })`，删除了旧的 `createAlipayPayment` / `startAlipayPolling`。
+- `service` 字段改为 `product.alipay?.serviceId ?? product.name`（用 `alipay_service_id`，回退到商品名）。
+- `buy.ts` 的支付宝分支改为调用该接口；QR 展示移入 `onPending`，履约/超时走 `onPaid`/`onFailed`。
+- `database.ts` 新增支付宝写入路径（`setServerAlipay` + `createProduct`/`updateProduct` 现写入 alipay 字段）。⚠️ 命令层入口（`/setup alipay`、`/product` 的 alipay 选项）**尚未接线**，所以目前服务器/商品的支付宝配置仍需手工写库；这块是独立的待办（原「给 /setup 与 /product 增加支付宝支持」需求）。
+
+> ⚠️ **依赖坑（已处理）**：SDK 经 `@solana/spl-token` 传递依赖 `bigint-buffer`，其预编译二进制在 **Node v22 上加载即段错误（SIGSEGV）**，会让 bot 启动崩溃。已用 `npm rebuild bigint-buffer` 修复，并在 `package.json` 加 `postinstall: npm rebuild bigint-buffer` 让全新安装也自动重建。若 bot 启动即 segfault，先跑 `npm rebuild bigint-buffer`。
+
+**已实施收款端（方案 B：bot 进程内自托管 cashier，2026-06-05）：**
+确认 `/execute` 即 bot 的收款入口（1.7.0 标准架构：买方=MoltsPayClient，卖方=持 RSA2 商户私钥、产出并签名 402 的 moltspay server，见 `payment-agent/docs/ALIPAY-RAIL.md`）。采用**方案 B**——bot 同进程内起一个 `MoltsPayServer` 充当收银台：
+
+- `alipay/moltspay.services.json`：bot 商品 manifest。`provider.alipay` 复用现有商户（seller `2088641494699428`，**绝对路径**引用 `skills/video_gen/cert/` 的 RSA2 证书，未复制私钥）；`services` 为每个支付宝商品注册一条（`zen7-vip` ¥35 / `zen7-subscription` ¥0.50 / `test-video` ¥1），service id = 商品名，`input` 留空（避免缺参 400）。
+- `src/services/alipayServer.ts`：`startAlipayServer()` 启动 cashier（端口 `ALIPAY_SERVER_PORT`，默认 8412），为每个 service 注册**空占位 handler**（履约在 bot 的 onPaid 发角色，server 不负责）；`getAlipayEndpoint()` 暴露本地 `/execute`。
+- `src/index.ts`：启动时调用 `startAlipayServer()`（失败非致命，回退到 per-server 配置端点）。
+- `src/commands/buy.ts`：支付宝端点优先用 `getAlipayEndpoint()`，回退 `server.alipayServiceEndpoint`。
+
+验证：`MoltsPayServer` 起后 `POST /execute {service:"zen7-vip"}` → **402 + Payment-Needed**（商户签名挑战），未知 service → 404。`tsc`/`build`/编译产物冒烟均通过。
+
+**运行时发现并修复（2026-06-05，重要）：**
+- **双 `/execute` bug**：`MoltsPayClient.pay(serverUrl, …)` 内部会自己拼 `/execute`。若传入的 endpoint 已含 `/execute`（如 `http://host:8412/execute`），会变成 `/execute/execute` → 404 `Not found`，pay() 在 onPaymentPending 前快速抛错（Discord 表现为交互失败）。**已修复**：`alipay.ts` 用 `serviceEndpoint.replace(/\/+execute\/?$/i, '')` 取 base url 再传给 `pay()`。`getAlipayEndpoint()` 返回带 `/execute` 的串仍可用于 curl/health，buyer 侧会自动归一。
+- **`SERVICE_PRICE_MISMATCH`（商户后台配置，非代码）**：修复后链路跑到支付宝网关，`zen7-vip`(¥35)/`zen7-subscription`(¥0.50) 报「服务价格不匹配」。原因：manifest 未给它们单独 `service_id`，默认用 `provider.alipay.service_id_default = API_0EA6DC4FC99A4DF7`，而该 service_id 在**支付宝商户后台注册单价为 ¥1.00**（test-video ¥1 因此能成）。要支持其它金额，需在支付宝开放平台为对应金额注册 service_id，并在 manifest 的 `services[].alipay.service_id` 指定。
+
+**仍需按环境核对（非代码）：**
+1. 商户后台「服务单价」需与 manifest 的 `alipay.price_cny` 一致，否则 `SERVICE_PRICE_MISMATCH`；
+2. 商户证书路径（现绝对引用 video_gen 的 cert）在部署机上要可读；
+3. 新增支付宝商品时，往 `alipay/moltspay.services.json` 加一条 service（id=商品名）即可。
+
+> 注：早前列的「指 `alipay_service_endpoint` 到外部端点 / 用 `alipay_service_id` 映射」已被方案 B 取代——bot 自带收银台，端点指向自身，service id 用商品名。`alipay_service_id` 仍可选用作覆盖。
+
+（注：早前「两系统互不相关、修复在 bot 侧自建 402」的判断已被澄清更新——`/execute` 即 bot 的收款端点，集成走 SDK；video_gen 只是当时错挂在 8402 的无关清单。）
+
 ---
 
 ## 14. 部署清单

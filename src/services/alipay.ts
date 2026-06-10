@@ -1,49 +1,38 @@
 /**
- * Alipay Payment Service - handles Alipay AI 收 via alipay-bot CLI
- * 
- * Flow:
- * 1. Get 402 Payment-Needed from server
- * 2. alipay-bot payment-intent → session handshake
- * 3. alipay-bot check-wallet → verify wallet opened
- * 4. Save Payment-Needed to temp file
- * 5. alipay-bot 402-buyer-pay → get payment URL + tradeNo
- * 6. Poll payment status until paid/timeout
- * 7. Return result
+ * Alipay Payment Service — handles Alipay AI 收 via the moltspay SDK.
+ *
+ * Integration (1.7.0+): uses `MoltsPayClient.pay(endpoint, service, params,
+ * { rail: 'alipay', ... })` from the official `moltspay` SDK instead of
+ * hand-rolling the 402 fetch + alipay-bot CLI orchestration. The SDK runs the
+ * whole alipay state machine internally (hit resource → 402 challenge →
+ * selectRail → alipay-bot → poll) and resolves with the resource body once paid.
+ *
+ * Control flow:
+ *   client.pay() is a single long-lived promise. It fires `onPaymentPending`
+ *   mid-flight (once the payment URL + tradeNo are known) and resolves only
+ *   after settlement. We therefore:
+ *     - render the QR + create the DB record inside onPaymentPending, then
+ *       resolve `startAlipayPayment` so the Discord handler can return;
+ *     - deliver paid / failed asynchronously via the onPaid / onFailed handlers;
+ *     - reject (before onPending fires) if the link could not be created, so the
+ *       caller can show "创建失败".
  */
 
-import { spawn } from 'child_process';
 import QRCode from 'qrcode';
-import { mkdir, writeFile, unlink } from 'fs/promises';
+import { mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
-import { createPayment, updatePayment, getPayment } from './database';
+import { MoltsPayClient } from 'moltspay';
+import { createPayment, updatePayment } from './database';
 import { generateId } from '../utils/crypto';
-import type { PaymentSession, Product } from '../types';
+import type { Product } from '../types';
 
-const ALIPAY_POLL_INTERVAL_MS = 5000; // 5 seconds
-const ALIPAY_MAX_POLL_MS = 30 * 60 * 1000; // 30 minutes (matches pay_before)
-// Hard cap on poll iterations as a safety net against runaway recursion
-// (e.g. if the elapsed-time guard ever fails or the CLI keeps erroring).
-const ALIPAY_MAX_POLLS = Math.ceil(ALIPAY_MAX_POLL_MS / ALIPAY_POLL_INTERVAL_MS); // 360
+// Overall budget for an alipay payment. Mirrors the alipay challenge's
+// pay_before window; the SDK polls until paid or this timeout elapses.
+const ALIPAY_MAX_POLL_MS = 30 * 60 * 1000; // 30 minutes
 
-// Allowed env vars for alipay-bot
-const ALLOWED_ENV = new Set([
-  'AIPAY_OUTPUT_CHANNEL',
-  'AIPAY_SESSION_ID',
-  'AIPAY_FRAMEWORK',
-  'AIPAY_MODEL',
-  'AIPAY_OS',
-  'PATH',
-  'HOME',
-]);
-
-function filterEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return Object.fromEntries(
-    Object.entries(env).filter(([k]) => ALLOWED_ENV.has(k)),
-  ) as NodeJS.ProcessEnv;
-}
-
-export interface AlipayPaymentResult {
+/** Info surfaced once the payment link/QR is ready (before settlement). */
+export interface AlipayPendingInfo {
   paymentId: string;
   tradeNo: string;
   paymentUrl?: string;
@@ -52,361 +41,134 @@ export interface AlipayPaymentResult {
   expiresAt: Date;
 }
 
-interface CliResult {
-  exitCode: number;
-  lines: string[];
+export interface AlipayHandlers {
+  /** Fired once the QR/link is ready. Resolving startAlipayPayment waits on this. */
+  onPending: (info: AlipayPendingInfo) => void | Promise<void>;
+  /** Fired async when payment succeeds. */
+  onPaid: (paymentId: string, tradeNo: string) => void | Promise<void>;
+  /** Fired async when payment fails / times out / is cancelled (after onPending). */
+  onFailed: (paymentId: string, reason: string) => void | Promise<void>;
 }
 
 /**
- * Run alipay-bot CLI command
- */
-const CLI_DEFAULT_TIMEOUT_MS = 60_000; // per-call hard timeout
-
-function runCli(
-  args: string[],
-  opts?: { env?: NodeJS.ProcessEnv; timeoutMs?: number },
-): Promise<CliResult> {
-  return new Promise((resolve, reject) => {
-    const lines: string[] = [];
-    const child = spawn('alipay-bot', args, {
-      env: { ...filterEnv(process.env), ...(opts?.env ?? {}) },
-    });
-
-    // Hard timeout: the Alipay gateway (aigw.alipay.com) is slow/flaky, and a
-    // hung CLI call would otherwise leave the Discord "正在生成支付链接" spinner
-    // forever. Kill the child and reject so the caller surfaces an error.
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGKILL');
-      reject(new Error(`alipay-bot ${args[0]} timed out after ${opts?.timeoutMs ?? CLI_DEFAULT_TIMEOUT_MS}ms`));
-    }, opts?.timeoutMs ?? CLI_DEFAULT_TIMEOUT_MS);
-    timer.unref?.();
-
-    let stdoutBuf = '';
-    let stderrBuf = '';
-
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdoutBuf += chunk.toString('utf-8');
-      let nl: number;
-      while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
-        const line = stdoutBuf.slice(0, nl).trim();
-        if (line) lines.push(line);
-        stdoutBuf = stdoutBuf.slice(nl + 1);
-      }
-    });
-
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderrBuf += chunk.toString('utf-8');
-      let nl: number;
-      while ((nl = stderrBuf.indexOf('\n')) !== -1) {
-        const line = stderrBuf.slice(0, nl).trim();
-        if (line) lines.push(line);
-        stdoutBuf = stderrBuf.slice(nl + 1);
-      }
-    });
-
-    child.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(err);
-    });
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ exitCode: code ?? 1, lines });
-    });
-  });
-}
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-/**
- * Markers that mean the wallet genuinely needs setup (user action required).
- * Anything else with code !== 200 is treated as a transient gateway hiccup.
- */
-const WALLET_SETUP_NEEDED = /未开通|未开启|未授权|等待授权|NOT[_\s-]*(OPEN|BOUND|SET)|NEEDS?[_\s-]*SETUP/i;
-
-/**
- * Verify the Alipay wallet is opened & ready, with retry on transient failures.
+ * Start an Alipay payment via the moltspay SDK.
  *
- * The Alipay gateway (aigw.alipay.com) intermittently returns
- * `{code:500, message:"查询失败"}` (~1 in 4 calls). The wallet itself is fine —
- * it's a flaky network query — so we retry with backoff. Only a genuine
- * "未开通/未授权" response (real user setup needed) fails fast without retry.
+ * Resolves once the payment link/QR has been surfaced via `handlers.onPending`
+ * (the caller can then return). Settlement is delivered asynchronously through
+ * `handlers.onPaid` / `handlers.onFailed`. Rejects — WITHOUT firing onPending —
+ * if the payment link could not be created (e.g. the 402 endpoint is
+ * unreachable, the service is not offered, or the alipay rail isn't available).
  */
-// Cache a successful wallet-ready result. `check-wallet` hits the slow Alipay
-// gateway (10–30s/call), so re-verifying on every /buy makes the spinner drag.
-// Wallet state rarely changes, so a short TTL is safe.
-let walletReadyUntilMs = 0;
-const WALLET_READY_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-async function checkWalletReady(maxRetries = 3): Promise<void> {
-  if (Date.now() < walletReadyUntilMs) return; // recently confirmed ready
-
-  let lastMsg = 'no output';
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (attempt > 0) await sleep(800 * attempt); // backoff: 0.8s, 1.6s, 2.4s
-
-    const walletCheck = await runCli(['check-wallet']);
-    const walletText = walletCheck.lines.join('\n').trim();
-
-    let walletJson: { code?: number; message?: string; reason?: string };
-    try {
-      walletJson = JSON.parse(walletText);
-    } catch {
-      lastMsg = walletText || 'unparseable output';
-      continue; // unparseable → treat as transient, retry
-    }
-
-    if (walletJson.code === 200) {
-      walletReadyUntilMs = Date.now() + WALLET_READY_TTL_MS; // cache success
-      return; // ready
-    }
-
-    lastMsg = walletJson.message || walletText;
-    // Genuine setup-needed → no point retrying, surface actionable error.
-    if (WALLET_SETUP_NEEDED.test(lastMsg)) {
-      throw new Error(`Alipay wallet not ready: ${lastMsg}`);
-    }
-    // Otherwise transient ("查询失败" / gateway error) → loop & retry.
-  }
-  throw new Error(`Alipay wallet check failed after ${maxRetries + 1} attempts: ${lastMsg}`);
-}
-
-/**
- * Parse tradeNo from CLI output (32-digit number)
- */
-function parseTradeNo(lines: string[]): string | null {
-  for (const line of lines) {
-    const labeled = line.match(/trade[_-]?no["'\s:=]+(\d{32})/i);
-    if (labeled) return labeled[1];
-    const bare = line.match(/\b(\d{32})\b/);
-    if (bare) return bare[1];
-  }
-  return null;
-}
-
-/**
- * Parse qrcode image path from CLI output (MEDIA: line)
- */
-function parseQrcodePath(lines: string[]): string | null {
-  for (const line of lines) {
-    // Format 1: MEDIA: /path/to/xxx.png
-    const m1 = line.match(/^MEDIA:\s*(.+\.png)$/i);
-    if (m1) return m1[1].trim();
-    // Format 2: ![图片](/path/to/xxx.png) - Markdown image
-    const m2 = line.match(/^!\[.*?\]\((.+\.png)\)$/i);
-    if (m2) return m2[1].trim();
-  }
-  return null;
-}
-
-/**
- * Parse payment URL from CLI output
- */
-function parsePaymentUrl(lines: string[]): { paymentUrl?: string; shortenUrl?: string } {
-  let paymentUrl: string | undefined;
-  let shortenUrl: string | undefined;
-  for (const line of lines) {
-    // Skip markdown image lines - those are qrcode paths, not payment URLs
-    if (/^!\[.*?\]\(/.test(line)) continue;
-    const m = line.match(/(alipays?:\/\/\S+|https?:\/\/\S+)/i);
-    if (!m) continue;
-    const url = m[1].replace(/[`)\]]+$/, ''); // strip trailing markdown/closing chars
-    // Skip 404/invalid URLs
-    if (/render\.alipay\.com/.test(url)) continue;
-    if (/short|qr\.alipay|surl|\/s\//i.test(line) && !shortenUrl) shortenUrl = url;
-    else if (!paymentUrl) paymentUrl = url;
-  }
-  if (!paymentUrl && shortenUrl) paymentUrl = shortenUrl;
-  return { paymentUrl, shortenUrl };
-}
-
-/**
- * Create alipay payment session and get payment URL
- */
-export async function createAlipayPayment(
+export async function startAlipayPayment(
   userId: string,
   serverId: string,
   product: Product,
   serviceEndpoint: string,
   priceCny: string,
-): Promise<AlipayPaymentResult> {
+  handlers: AlipayHandlers,
+): Promise<void> {
   const paymentId = generateId();
   const expiresAt = new Date(Date.now() + ALIPAY_MAX_POLL_MS);
-  const sessionId = `discord-${paymentId}`;
-
-  // Step 0: Trigger 402 to get Payment-Needed header
-  const res = await fetch(serviceEndpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept-Payment-Rail': 'alipay',
-    },
-    body: JSON.stringify({ service: product.name, params: {} }),
-    signal: AbortSignal.timeout(30_000), // don't hang on a slow/unreachable endpoint
-  });
-
-  if (res.status !== 402) {
-    throw new Error(`Expected 402, got ${res.status}`);
-  }
-
-  // Get Payment-Needed header
-  const paymentNeeded = res.headers.get('payment-needed');
-  if (!paymentNeeded) {
-    throw new Error('Server did not return Payment-Needed header for alipay');
-  }
-
-  // Create payment session in DB
-  createPayment({
-    paymentId,
-    discordUserId: userId,
-    discordServerId: serverId,
-    productId: product.id,
-    amount: parseFloat(priceCny),
-    currency: 'CNY',
-    chain: 'alipay',
-    status: 'pending',
-    createdAt: new Date(),
-    expiresAt,
-  });
-
-  // Step 1: payment-intent
-  await runCli([
-    'payment-intent',
-    '--session-id', sessionId,
-    '--intent-summary', `购买 ${product.name}`,
-    '--framework', 'openclaw',
-  ]);
-
-  // Step 2: check-wallet (retries transient "查询失败" gateway errors)
-  await checkWalletReady();
-
-  // Step 3: Save Payment-Needed to temp file
+  // Service id the 402 server registered for this product. Falls back to the
+  // product name for older configs that never set alipay_service_id.
+  const service = product.alipay?.serviceId ?? product.name;
   const dir = join(homedir(), '.moltspay', 'alipay');
-  await mkdir(dir, { recursive: true });
-  const challengeFile = join(dir, `402_${paymentId}.txt`);
-  await writeFile(challengeFile, paymentNeeded, 'utf-8');
 
-  // Step 4: 402-buyer-pay
-  const payResult = await runCli([
-    '402-buyer-pay',
-    '-f', challengeFile,
-    '-r', serviceEndpoint,
-    '-s', sessionId,
-    '-i', `购买 ${product.name}`,
-    '-w', 'openclaw',
-  ]);
+  // MoltsPayClient.pay() takes the server BASE url and appends `/execute`
+  // itself. Strip any trailing `/execute` so a stored endpoint like
+  // `http://host:8412/execute` doesn't become `/execute/execute` → 404.
+  const serverUrl = serviceEndpoint.replace(/\/+execute\/?$/i, '');
 
-  // Parse tradeNo and paymentUrl
-  const tradeNo = parseTradeNo(payResult.lines);
-  if (!tradeNo) {
-    // Clean up
-    await unlink(challengeFile).catch(() => {});
-    throw new Error(`alipay-bot did not return tradeNo. Output: ${payResult.lines.join('\n')}`);
-  }
+  // Fresh client per payment so each gets a stable, unique alipay session id.
+  const client = new MoltsPayClient({ alipaySessionId: `discord-${paymentId}` });
 
-  const { paymentUrl, shortenUrl } = parsePaymentUrl(payResult.lines);
-  let qrcodePath = parseQrcodePath(payResult.lines);
+  let tradeNo = '';
 
-  // Clean up challenge file
-  await unlink(challengeFile).catch(() => {});
+  await new Promise<void>((resolve, reject) => {
+    let pendingFired = false;
 
-  if (!paymentUrl && !qrcodePath) {
-    throw new Error(`alipay-bot did not return payment URL or qrcode. Output: ${payResult.lines.join('\n')}`);
-  }
+    client
+      .pay(serverUrl, service, {}, {
+        rail: 'alipay',
+        timeoutMs: ALIPAY_MAX_POLL_MS,
+        onPaymentPending: async (info) => {
+          try {
+            pendingFired = true;
+            tradeNo = info.tradeNo;
 
-  // This alipay-bot version no longer emits a MEDIA: qrcode path, so render the
-  // QR ourselves from the payment URL (prefer the scannable https cashier link).
-  if (!qrcodePath && paymentUrl) {
-    const qrUrl = [shortenUrl, paymentUrl].find((u) => u && /^https?:/i.test(u)) || paymentUrl;
-    const qrFile = join(dir, `qr_${paymentId}.png`);
-    try {
-      await QRCode.toFile(qrFile, qrUrl, { width: 360, margin: 2 });
-      qrcodePath = qrFile;
-    } catch (e) {
-      console.error('[Alipay] QR generation failed:', e);
-    }
-  }
+            // Persist the payment record now that we have a tradeNo.
+            createPayment({
+              paymentId,
+              discordUserId: userId,
+              discordServerId: serverId,
+              productId: product.id,
+              amount: parseFloat(priceCny),
+              currency: 'CNY',
+              chain: 'alipay',
+              status: 'pending',
+              createdAt: new Date(),
+              expiresAt,
+            });
 
-  return {
-    paymentId,
-    tradeNo,
-    paymentUrl,
-    shortenUrl,
-    qrcodePath: qrcodePath || undefined,
-    expiresAt,
-  };
-}
+            // alipay-bot prints the link inside a markdown `[文字](url)`, and the
+            // SDK's URL regex greedily captures the trailing `)` → the QR/link
+            // 404s. Strip trailing markdown/punctuation before use.
+            const cleanUrl = (u?: string): string | undefined =>
+              u ? u.replace(/[)\]`>，。、\s]+$/u, '').trim() : undefined;
+            const paymentUrl = cleanUrl(info.paymentUrl);
+            const shortenUrl = cleanUrl(info.shortenUrl);
 
-/**
- * Poll alipay payment status until confirmed or timeout
- */
-export function startAlipayPolling(
-  paymentId: string,
-  tradeNo: string,
-  serviceEndpoint: string,
-  onPaid: (paymentId: string, tradeNo: string) => void,
-  onExpired: (paymentId: string) => void,
-): void {
-  const startTime = Date.now();
-  let pollCount = 0;
+            // Render a QR from the scannable cashier URL (prefer https).
+            let qrcodePath: string | undefined;
+            const qrUrl = [shortenUrl, paymentUrl].find(
+              (u) => u && /^https?:/i.test(u),
+            ) || paymentUrl;
+            if (qrUrl) {
+              await mkdir(dir, { recursive: true });
+              const qrFile = join(dir, `qr_${paymentId}.png`);
+              try {
+                await QRCode.toFile(qrFile, qrUrl, { width: 360, margin: 2 });
+                qrcodePath = qrFile;
+              } catch (e) {
+                console.error('[Alipay] QR generation failed:', e);
+              }
+            }
 
-  const poll = async () => {
-    pollCount++;
-    // Stop on timeout OR hard poll-count cap, whichever comes first.
-    if (Date.now() - startTime > ALIPAY_MAX_POLL_MS || pollCount > ALIPAY_MAX_POLLS) {
-      updatePayment(paymentId, { status: 'expired' });
-      onExpired(paymentId);
-      return;
-    }
+            await handlers.onPending({
+              paymentId,
+              tradeNo,
+              paymentUrl,
+              shortenUrl,
+              qrcodePath,
+              expiresAt,
+            });
 
-    // Check if still pending
-    const payment = getPayment(paymentId);
-    if (!payment || payment.status !== 'pending') {
-      return; // Already handled
-    }
-
-    try {
-      const result = await runCli([
-        '402-query-payment-status',
-        '-t', tradeNo,
-        '-r', serviceEndpoint,
-      ]);
-
-      const text = result.lines.join('\n').trim();
-
-      // Check for success markers
-      if (text.includes('支付状态成功') || text.includes('SUCCESS') || text.includes('"status": 200')) {
-        updatePayment(paymentId, {
-          status: 'paid',
-          txHash: tradeNo,
-          paidAt: new Date(),
-        });
-        onPaid(paymentId, tradeNo);
-        return;
-      }
-
-      // Check for rejection
-      if (text.includes('支付已取消') || text.includes('REJECTED') || text.includes('CANCELLED')) {
-        updatePayment(paymentId, { status: 'failed' });
-        onExpired(paymentId);
-        return;
-      }
-
-      // Still pending, continue polling
-      setTimeout(poll, ALIPAY_POLL_INTERVAL_MS);
-    } catch (error) {
-      console.error(`[AlipayPoller] Error for ${paymentId}:`, error);
-      // Retry on error
-      setTimeout(poll, ALIPAY_POLL_INTERVAL_MS);
-    }
-  };
-
-  // Start polling after a short delay
-  setTimeout(poll, 5000);
+            // Link is ready — let the caller return. Settlement continues in
+            // the .then()/.catch() below.
+            resolve();
+          } catch (e) {
+            // onPending machinery failed before we surfaced the link → treat as
+            // a creation failure so the caller shows "创建失败".
+            if (!pendingFired) reject(e as Error);
+            else console.error('[Alipay] onPending handler error:', e);
+          }
+        },
+      })
+      .then(async () => {
+        // pay() resolved → server returned the resource → payment succeeded.
+        updatePayment(paymentId, { status: 'paid', txHash: tradeNo, paidAt: new Date() });
+        await handlers.onPaid(paymentId, tradeNo);
+      })
+      .catch(async (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!pendingFired) {
+          // Failed before the link was ready → creation failure.
+          reject(err instanceof Error ? err : new Error(msg));
+        } else {
+          // Failed after the QR was shown → timeout / cancel / settlement error.
+          updatePayment(paymentId, { status: 'expired' });
+          await handlers.onFailed(paymentId, msg);
+        }
+      });
+  });
 }

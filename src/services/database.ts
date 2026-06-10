@@ -219,6 +219,28 @@ export function setServerFiatMarkup(serverId: string, markup: number): void {
   db.prepare('UPDATE servers SET fiat_markup = ? WHERE server_id = ?').run(markup, serverId);
 }
 
+/**
+ * Update a server's Alipay configuration. Only the provided fields are touched,
+ * so callers can toggle `enabled` without clobbering seller_id / endpoint.
+ * Pass `null` to explicitly clear a field.
+ */
+export function setServerAlipay(
+  serverId: string,
+  config: { enabled?: boolean; sellerId?: string | null; serviceEndpoint?: string | null }
+): void {
+  const fields: string[] = [];
+  const values: any[] = [];
+
+  if (config.enabled !== undefined) { fields.push('alipay_enabled = ?'); values.push(config.enabled ? 1 : 0); }
+  if (config.sellerId !== undefined) { fields.push('alipay_seller_id = ?'); values.push(config.sellerId); }
+  if (config.serviceEndpoint !== undefined) { fields.push('alipay_service_endpoint = ?'); values.push(config.serviceEndpoint); }
+
+  if (fields.length === 0) return;
+
+  values.push(serverId);
+  db.prepare(`UPDATE servers SET ${fields.join(', ')} WHERE server_id = ?`).run(...values);
+}
+
 export function upsertServerWallet(serverId: string, walletType: 'evm' | 'solana', walletAddress: string): void {
   const column = walletType === 'evm' ? 'evm_wallet' : 'solana_wallet';
   
@@ -271,8 +293,8 @@ export function getAvailableChainsForServer(serverId: string, requestedChains: s
 export function createProduct(product: Omit<Product, 'createdAt'>): void {
   const chainsJson = JSON.stringify(product.chains);
   db.prepare(`
-    INSERT INTO products (id, server_id, name, type, price, currency, chains, discord_role_id, service_endpoint, file_url, webhook_url, billing_type, billing_period, active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO products (id, server_id, name, type, price, currency, chains, discord_role_id, service_endpoint, file_url, webhook_url, billing_type, billing_period, active, alipay_price_cny, alipay_goods_name, alipay_service_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     product.id,
     product.serverId,
@@ -287,7 +309,10 @@ export function createProduct(product: Omit<Product, 'createdAt'>): void {
     product.webhookUrl || null,
     product.billingType || 'one_time',
     product.billingPeriod || null,
-    product.active ? 1 : 0
+    product.active ? 1 : 0,
+    product.alipay?.priceCny ?? null,
+    product.alipay?.goodsName ?? null,
+    product.alipay?.serviceId ?? null
   );
 }
 
@@ -322,7 +347,13 @@ export function updateProduct(productId: string, updates: Partial<Product>): voi
   if (updates.chains !== undefined) { fields.push('chains = ?'); values.push(JSON.stringify(updates.chains)); }
   if (updates.billingType !== undefined) { fields.push('billing_type = ?'); values.push(updates.billingType); }
   if (updates.billingPeriod !== undefined) { fields.push('billing_period = ?'); values.push(updates.billingPeriod); }
-  
+  if (updates.alipay !== undefined) {
+    // `alipay: null/undefined` clears the config; an object writes all 3 columns.
+    fields.push('alipay_price_cny = ?'); values.push(updates.alipay?.priceCny ?? null);
+    fields.push('alipay_goods_name = ?'); values.push(updates.alipay?.goodsName ?? null);
+    fields.push('alipay_service_id = ?'); values.push(updates.alipay?.serviceId ?? null);
+  }
+
   if (fields.length === 0) return;
   
   values.push(productId);

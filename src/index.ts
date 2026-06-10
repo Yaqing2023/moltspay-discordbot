@@ -5,10 +5,19 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Collection, Events } from 'discord.js';
 import express from 'express';
+import { setAlipayLogLevel, setAlipayLogSink } from 'moltspay';
 import { initDatabase, getPayment, getProduct } from './services/database';
 import { setPaymentCallbacks } from './services/poller';
 import { fulfill } from './services/fulfillment';
 import { startCron } from './services/cron';
+import { startAlipayServer } from './services/alipayServer';
+
+// Alipay rail observability: surface the SDK's per-node timing breakdown
+// (flow.start → step.end(per spawn) → flow.pending(pre-QR total) → flow.settled)
+// into bot.log via console so we can see exactly where the pre-QR time goes.
+// Level: MOLTSPAY_ALIPAY_LOG env (info|debug), default 'info' here.
+setAlipayLogLevel((process.env.MOLTSPAY_ALIPAY_LOG as 'off' | 'info' | 'debug') || 'info');
+setAlipayLogSink((line) => console.log(line));
 
 // Validate required env vars
 const requiredEnvVars = ['DISCORD_TOKEN', 'DISCORD_CLIENT_ID', 'ENCRYPTION_KEY'];
@@ -247,7 +256,12 @@ async function main() {
     app.listen(webhookPort, () => {
       console.log(`✅ Webhook server listening on port ${webhookPort}`);
     });
-    
+
+    // Start in-process Alipay cashier (seller side of the 1.7.0 alipay rail).
+    // Non-fatal: if it can't start (e.g. missing merchant cert), alipay just
+    // falls back to the per-server configured endpoint.
+    startAlipayServer();
+
     // Login to Discord
     await client.login(process.env.DISCORD_TOKEN);
 
@@ -258,6 +272,19 @@ async function main() {
     process.exit(1);
   }
 }
+
+// Graceful shutdown — stop pollers and disconnect Discord cleanly
+import { stopAllPollers } from './services/poller';
+
+function gracefulShutdown(signal: string) {
+  console.log(`[Shutdown] Received ${signal}, cleaning up...`);
+  stopAllPollers();
+  client.destroy();
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 main();
 

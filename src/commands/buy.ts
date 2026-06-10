@@ -27,7 +27,8 @@ import {
   getPayment
 } from '../services/database';
 import { createPaymentSession } from '../services/payment';
-import { createAlipayPayment, startAlipayPolling } from '../services/alipay';
+import { startAlipayPayment } from '../services/alipay';
+import { getAlipayEndpoint } from '../services/alipayServer';
 import { fulfill } from '../services/fulfillment';
 import { startPolling } from '../services/poller';
 import { COLORS, productListEmbed } from '../utils/embeds';
@@ -239,7 +240,8 @@ async function showChainSelection(
     const chain = product.chains[0];
     const walletAddress = getServerWalletForChain(serverId, chain);
     if (!walletAddress) {
-      await interaction.update({ 
+      // Already deferUpdate'd above → editReply (update would throw).
+      await interaction.editReply({
         content: `❌ No wallet configured for ${chain}. Please contact server admin.`,
         embeds: [],
         components: []
@@ -398,7 +400,11 @@ async function showAlipayPayment(
 ) {
   await interaction.deferUpdate();
 
-  if (!product.alipay || !server.alipayServiceEndpoint) {
+  // Prefer the bot's in-process cashier (Option B); fall back to a per-server
+  // configured endpoint if the in-process server isn't running.
+  const alipayEndpoint = getAlipayEndpoint() || server.alipayServiceEndpoint;
+
+  if (!product.alipay || !alipayEndpoint) {
     await interaction.editReply({
       content: '❌ Alipay payment is not configured for this product or server.',
       embeds: [],
@@ -420,121 +426,133 @@ async function showAlipayPayment(
   });
 
   try {
-    const result = await createAlipayPayment(
+    await startAlipayPayment(
       interaction.user.id,
       serverId,
       product,
-      server.alipayServiceEndpoint,
+      alipayEndpoint,
       product.alipay.priceCny,
-    );
+      {
+        // Link/QR ready → render the payment message.
+        onPending: async (info) => {
+          const embed = new EmbedBuilder()
+            .setTitle(`🅰️ 支付宝支付 - ${product.name}`)
+            .setColor(COLORS.PRIMARY)
+            .setDescription(`请使用支付宝扫描下方二维码完成支付`)
+            .addFields(
+              { name: '金额', value: `¥${product.alipay!.priceCny} CNY`, inline: true },
+              { name: '商品', value: product.alipay!.goodsName, inline: true },
+              { name: '有效期', value: `<t:${Math.floor(info.expiresAt.getTime() / 1000)}:R>`, inline: true },
+            )
+            .setFooter({ text: `Payment ID: ${info.paymentId} | TradeNo: ${info.tradeNo}` });
 
-    const embed = new EmbedBuilder()
-      .setTitle(`🅰️ 支付宝支付 - ${product.name}`)
-      .setColor(COLORS.PRIMARY)
-      .setDescription(`请使用支付宝扫描下方二维码完成支付`)
-      .addFields(
-        { name: '金额', value: `¥${product.alipay.priceCny} CNY`, inline: true },
-        { name: '商品', value: product.alipay.goodsName, inline: true },
-        { name: '有效期', value: `<t:${Math.floor(result.expiresAt.getTime() / 1000)}:R>`, inline: true },
-      )
-      .setFooter({ text: `Payment ID: ${result.paymentId} | TradeNo: ${result.tradeNo}` });
+          const mobileUrl = info.shortenUrl || info.paymentUrl;
+          const row = mobileUrl
+            ? new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setLabel('📱 手机打开支付宝')
+                  .setStyle(ButtonStyle.Link)
+                  .setURL(mobileUrl),
+              )
+            : null;
 
-    // Attach qrcode image if available
-    if (result.qrcodePath) {
-      const qrAttachment = new AttachmentBuilder(result.qrcodePath, { name: 'qrcode.png' });
-      embed.setImage('attachment://qrcode.png');
-      embed.addFields({
-        name: '📝 支付步骤',
-        value: '1. 打开支付宝APP\n2. 扫描上方二维码\n3. 确认支付',
-      });
-
-      const replyOptions: any = {
-        embeds: [embed],
-        files: [qrAttachment],
-        components: [],
-      };
-
-      // Add mobile button only if we have a valid payment URL
-      if (result.shortenUrl || result.paymentUrl) {
-        const row = new ActionRowBuilder<ButtonBuilder>()
-          .addComponents(
-            new ButtonBuilder()
-              .setLabel('📱 手机打开支付宝')
-              .setStyle(ButtonStyle.Link)
-              .setURL(result.shortenUrl || result.paymentUrl!),
-          );
-        replyOptions.components = [row];
-      }
-
-      await interaction.editReply(replyOptions);
-    } else {
-      // No qrcode, fall back to link only
-      embed.addFields({
-        name: '📝 支付步骤',
-        value: '1. 点击下方按钮打开支付页面\n2. 用支付宝扫码或确认支付\n3. 支付完成后自动检测',
-      });
-
-      const row = new ActionRowBuilder<ButtonBuilder>()
-        .addComponents(
-          new ButtonBuilder()
-            .setLabel('📱 手机打开支付宝')
-            .setStyle(ButtonStyle.Link)
-            .setURL(result.shortenUrl || result.paymentUrl!),
-        );
-
-      await interaction.editReply({
-        embeds: [embed],
-        components: [row],
-      });
-    }
-
-    // Start polling for alipay payment
-    startAlipayPolling(
-      result.paymentId,
-      result.tradeNo,
-      server.alipayServiceEndpoint,
-      // onPaid callback
-      async (paymentId: string, tradeNo: string) => {
-        // Fulfill the order (assign role / deliver digital / webhook), same as
-        // the EVM path. Without this an Alipay role purchase never grants the role.
-        let fulfillMessage = '';
-        try {
-          const payment = getPayment(paymentId);
-          if (payment) {
-            const result = await fulfill(interaction.client, payment, product);
-            console.log(`[Alipay] Fulfillment result for ${paymentId}:`, result);
-            fulfillMessage = result.success
-              ? ''
-              : `\n⚠️ 履约失败：${result.message}。请联系管理员并提供 Payment ID: \`${paymentId}\``;
-          }
-        } catch (err) {
-          console.error('[Alipay] Fulfillment failed:', err);
-          fulfillMessage = `\n⚠️ 履约异常，请联系管理员并提供 Payment ID: \`${paymentId}\``;
-        }
-
-        try {
-          const channel = interaction.channel;
-          if (channel && channel.isSendable()) {
-            await channel.send({
-              content: `✅ <@${interaction.user.id}> 支付成功！交易号: \`${tradeNo}\`\n\n商品 **${product.name}** 已购买成功！${fulfillMessage}`,
+          if (info.qrcodePath) {
+            embed.setImage('attachment://qrcode.png');
+            embed.addFields({
+              name: '📝 支付步骤',
+              value: '1. 打开支付宝APP\n2. 扫描上方二维码\n3. 确认支付',
+            });
+            await interaction.editReply({
+              embeds: [embed],
+              files: [new AttachmentBuilder(info.qrcodePath, { name: 'qrcode.png' })],
+              components: row ? [row] : [],
+            });
+          } else {
+            // No QR → link only.
+            embed.addFields({
+              name: '📝 支付步骤',
+              value: '1. 点击下方按钮打开支付页面\n2. 用支付宝扫码或确认支付\n3. 支付完成后自动检测',
+            });
+            await interaction.editReply({
+              embeds: [embed],
+              components: row ? [row] : [],
             });
           }
-        } catch (err) {
-          console.error('[Alipay] Failed to send payment confirmation:', err);
-        }
-      },
-      // onExpired callback
-      async (paymentId: string) => {
-        try {
-          const channel = interaction.channel;
-          if (channel && channel.isSendable()) {
-            await channel.send({
-              content: `⏰ <@${interaction.user.id}> 支付超时，支付已取消。请重新使用 \`/buy\` 发起支付。`,
-            });
+        },
+        // Paid → fulfill (assign role / deliver / webhook), same as the EVM path.
+        onPaid: async (paymentId, tradeNo) => {
+          let fulfillMessage = '';
+          try {
+            const payment = getPayment(paymentId);
+            if (payment) {
+              const fulfillResult = await fulfill(interaction.client, payment, product);
+              console.log(`[Alipay] Fulfillment result for ${paymentId}:`, fulfillResult);
+              fulfillMessage = fulfillResult.success
+                ? ''
+                : `\n⚠️ 履约失败：${fulfillResult.message}。请联系管理员并提供 Payment ID: \`${paymentId}\``;
+            }
+          } catch (err) {
+            console.error('[Alipay] Fulfillment failed:', err);
+            fulfillMessage = `\n⚠️ 履约异常，请联系管理员并提供 Payment ID: \`${paymentId}\``;
           }
-        } catch (err) {
-          console.error('[Alipay] Failed to send expiry notice:', err);
-        }
+
+          // Update the original (ephemeral) QR message in place: clear the QR
+          // image + button and show success. The interaction token is valid for
+          // ~15 min; if the payment took longer this throws, so the channel.send
+          // below stays as the durable confirmation.
+          try {
+            const doneEmbed = new EmbedBuilder()
+              .setTitle(`✅ 支付成功 - ${product.name}`)
+              .setColor(COLORS.SUCCESS)
+              .setDescription(fulfillMessage ? `支付已完成。${fulfillMessage}` : '支付宝支付已完成，商品已交付！')
+              .addFields(
+                { name: '金额', value: `¥${product.alipay!.priceCny} CNY`, inline: true },
+                { name: '交易号', value: `\`${tradeNo}\``, inline: true },
+              )
+              .setFooter({ text: `Payment ID: ${paymentId}` });
+            await interaction.editReply({ embeds: [doneEmbed], components: [], files: [] });
+          } catch (err) {
+            console.error('[Alipay] Could not update QR message on paid (token may have expired):', err);
+          }
+
+          try {
+            const channel = interaction.channel;
+            if (channel && channel.isSendable()) {
+              await channel.send({
+                content: `✅ <@${interaction.user.id}> 支付成功！交易号: \`${tradeNo}\`\n\n商品 **${product.name}** 已购买成功！${fulfillMessage}`,
+              });
+            }
+          } catch (err) {
+            console.error('[Alipay] Failed to send payment confirmation:', err);
+          }
+        },
+        // Failed / timed out → update the QR message + notify in channel.
+        onFailed: async (paymentId, reason) => {
+          console.error(`[Alipay] Payment ${paymentId} failed/expired: ${reason}`);
+
+          // Clear the QR message in place (best-effort; token may have expired).
+          try {
+            const failEmbed = new EmbedBuilder()
+              .setTitle(`⏰ 支付未完成 - ${product.name}`)
+              .setColor(COLORS.WARNING)
+              .setDescription('支付超时或已取消。请重新使用 `/buy` 发起支付。')
+              .setFooter({ text: `Payment ID: ${paymentId}` });
+            await interaction.editReply({ embeds: [failEmbed], components: [], files: [] });
+          } catch (err) {
+            console.error('[Alipay] Could not update QR message on failure (token may have expired):', err);
+          }
+
+          try {
+            const channel = interaction.channel;
+            if (channel && channel.isSendable()) {
+              await channel.send({
+                content: `⏰ <@${interaction.user.id}> 支付未完成（超时或已取消）。请重新使用 \`/buy\` 发起支付。`,
+              });
+            }
+          } catch (err) {
+            console.error('[Alipay] Failed to send expiry notice:', err);
+          }
+        },
       },
     );
   } catch (error) {
@@ -567,11 +585,16 @@ async function showUsdcPayment(
   
   const embed = buildPaymentEmbed(product, chain, paymentId, expiresAt, amount);
   const rows = buildWalletButtons(chain, walletAddress, amount, paymentId);
-  
-  await interaction.update({ 
-    embeds: [embed], 
-    components: rows
-  });
+
+  // This is reached two ways: single-chain (caller already deferUpdate'd this
+  // interaction → must editReply) and multi-chain (a fresh chain-button
+  // interaction → update). Calling update() on an already-deferred interaction
+  // throws InteractionAlreadyReplied, so branch on its state.
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply({ embeds: [embed], components: rows });
+  } else {
+    await interaction.update({ embeds: [embed], components: rows });
+  }
   
   if (['base', 'polygon', 'bnb'].includes(chain)) {
     startPolling(paymentId, chain, walletAddress, amount);

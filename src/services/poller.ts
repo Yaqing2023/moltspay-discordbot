@@ -1,5 +1,11 @@
 /**
  * Payment Poller - checks blockchain for incoming USDC transfers
+ *
+ * Fixes (2026-06-04):
+ * - Reuse JsonRpcProvider per chain (was creating new ones → memory leak)
+ * - Hard time limit (20min) regardless of poll count
+ * - Force stop on repeated errors
+ * - stopAllPollers() for graceful shutdown
  */
 
 import { ethers } from 'ethers';
@@ -26,13 +32,12 @@ const TRANSFER_EVENT = 'event Transfer(address indexed from, address indexed to,
 // Polling config
 const POLL_INTERVAL_MS = 10_000; // 10 seconds
 const MAX_POLLS = 90; // 15 minutes total (90 × 10s = 900s)
+const MAX_POLL_AGE_MS = 20 * 60 * 1000; // 20 minutes hard limit
 
 // Active polling sessions
 const activePollers: Map<string, NodeJS.Timeout> = new Map();
 
-// Cached JsonRpcProvider per chain. Creating a new provider on every
-// startPolling leaks: each one spins up its own background block-polling loop
-// that is never torn down. Reuse a single long-lived provider per chain.
+// Cached JsonRpcProvider per chain (reuse instead of creating new ones each time)
 const providerCache: Map<string, ethers.JsonRpcProvider> = new Map();
 
 function getProvider(chain: string, rpcUrl: string): ethers.JsonRpcProvider {
@@ -40,6 +45,7 @@ function getProvider(chain: string, rpcUrl: string): ethers.JsonRpcProvider {
   if (!provider) {
     provider = new ethers.JsonRpcProvider(rpcUrl);
     providerCache.set(chain, provider);
+    console.log(`[Poller] Created cached provider for ${chain}`);
   }
   return provider;
 }
@@ -82,11 +88,25 @@ export async function startPolling(
   const provider = getProvider(chain, rpcUrl);
   const startBlock = await provider.getBlockNumber();
   let pollCount = 0;
+  const startTime = Date.now();
 
   console.log(`[Poller] Starting for payment ${paymentId} on ${chain}, block ${startBlock}`);
 
   const poll = async () => {
     pollCount++;
+
+    // Hard time limit - stop no matter what after MAX_POLL_AGE_MS
+    if (Date.now() - startTime > MAX_POLL_AGE_MS) {
+      console.log(`[Poller] ${paymentId}: hard time limit reached (${Math.round((Date.now() - startTime) / 1000)}s), stopping`);
+      stopPolling(paymentId);
+      const payment = getPayment(paymentId);
+      if (payment && payment.status === 'pending') {
+        updatePayment(paymentId, { status: 'expired' });
+        if (onPaymentExpired) onPaymentExpired(paymentId);
+      }
+      return;
+    }
+
     console.log(`[Poller] ${paymentId}: poll ${pollCount}/${MAX_POLLS}`);
 
     try {
@@ -147,6 +167,11 @@ export async function startPolling(
 
     } catch (error) {
       console.error(`[Poller] ${paymentId}: error`, error);
+      // Force stop if way too many errors to prevent infinite loops
+      if (pollCount > MAX_POLLS + 10) {
+        console.error(`[Poller] ${paymentId}: too many errors, force stopping`);
+        stopPolling(paymentId);
+      }
     }
   };
 
@@ -215,4 +240,15 @@ async function checkForTransfer(
  */
 export function getActivePollingCount(): number {
   return activePollers.size;
+}
+
+/**
+ * Stop all active pollers (for graceful shutdown)
+ */
+export function stopAllPollers(): void {
+  for (const [paymentId, interval] of activePollers) {
+    clearInterval(interval);
+    console.log(`[Poller] Stopped polling for ${paymentId} (shutdown)`);
+  }
+  activePollers.clear();
 }
