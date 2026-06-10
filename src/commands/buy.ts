@@ -141,7 +141,7 @@ async function showPaymentMethodSelection(
   }
   
   if (product.billingType === 'subscription') {
-    embed.addFields({ name: 'Billing', value: `${product.billingPeriod}ly subscription`, inline: true });
+    embed.addFields({ name: 'Billing', value: `${product.billingPeriod} subscription`, inline: true });
   }
   
   const row = new ActionRowBuilder<ButtonBuilder>();
@@ -224,7 +224,8 @@ async function showChainSelection(
     const chain = product.chains[0];
     const walletAddress = getServerWalletForChain(serverId, chain);
     if (!walletAddress) {
-      await interaction.update({ 
+      // interaction was already deferUpdate()'d above, so use editReply (not update)
+      await interaction.editReply({
         content: `❌ No wallet configured for ${chain}. Please contact server admin.`,
         embeds: [],
         components: []
@@ -399,11 +400,15 @@ async function showUsdcPayment(
   
   const embed = buildPaymentEmbed(product, chain, paymentId, expiresAt, amount);
   const rows = buildWalletButtons(chain, walletAddress, amount, paymentId);
-  
-  await interaction.update({ 
-    embeds: [embed], 
-    components: rows
-  });
+
+  // This is reached two ways:
+  //  - single-chain path: caller already deferUpdate()'d this interaction → must editReply
+  //  - multi-chain path: a fresh, unacknowledged chain-button interaction → update
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply({ embeds: [embed], components: rows });
+  } else {
+    await interaction.update({ embeds: [embed], components: rows });
+  }
   
   // Start polling for payment (EVM chains only for now)
   if (['base', 'polygon', 'bnb'].includes(chain)) {
