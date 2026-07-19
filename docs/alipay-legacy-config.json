@@ -1,0 +1,65 @@
+{
+  "_note": "支付宝集成于 2026-06-10 回退(见 docs/KNOWN-ISSUES.md)。代码保存在分支 backup/alipay-revert-20260610 (c42c700)。本文件保存回退时数据库中的支付宝配置数据,该数据于 2026-07-19 随字段删除而从库中移除。",
+  "_exported_at": "2026-07-19",
+  "products": [
+    {
+      "id": "d71832f3d3d283201b4805adad1c493d",
+      "name": "zen7-vip",
+      "alipay_price_cny": "35.00",
+      "alipay_goods_name": "Zen7 VIP 会员",
+      "alipay_service_id": null
+    },
+    {
+      "id": "71b4220afe1608299f1e26dda20058fb",
+      "name": "zen7-subscription",
+      "alipay_price_cny": "0.50",
+      "alipay_goods_name": "Zen7 月度订阅",
+      "alipay_service_id": null
+    },
+    {
+      "id": "23a474726464a110d901e8223b6dc212",
+      "name": "test-video",
+      "alipay_price_cny": "1.00",
+      "alipay_goods_name": "测试视频",
+      "alipay_service_id": null
+    }
+  ],
+  "servers": [
+    {
+      "server_id": "1472602423267819734",
+      "alipay_enabled": 1,
+      "alipay_seller_id": "2088641494699428",
+      "alipay_service_endpoint": "http://127.0.0.1:8402/execute"
+    }
+  ],
+  "servers_alipay_enabled_flags": [
+    {
+      "server_id": "1472602423267819734",
+      "alipay_enabled": 1
+    },
+    {
+      "server_id": "1471434739939278861",
+      "alipay_enabled": 0
+    },
+    {
+      "server_id": "1488330366388535369",
+      "alipay_enabled": 0
+    },
+    {
+      "server_id": "1382651832916246528",
+      "alipay_enabled": 0
+    },
+    {
+      "server_id": "333949691962195969",
+      "alipay_enabled": 0
+    },
+    {
+      "server_id": "1499131151200292984",
+      "alipay_enabled": 0
+    },
+    {
+      "server_id": "1499869832378585178",
+      "alipay_enabled": 0
+    }
+  ]
+}

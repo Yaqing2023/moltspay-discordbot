@@ -68,3 +68,9 @@ https://metamask.app.link/send/{token}@{chainId}/transfer?address={recipient}&ui
 2026-06-10 已将代码**回退到支付宝接入前**（`2a75a03` + cherry-pick 内存泄漏修复 `9b04b03`），**支付宝整套已移除**。当前仅 **USDC（链上）** 与 **信用卡（Coinbase Onramp）** 两条路径。信用卡需服务器设 `fiat-markup > 0` 且金额 ≥ $5。
 
 支付宝相关代码完整保存在分支 `backup/alipay-revert-20260610`（commit `c42c700`），需要时可取回。
+
+2026-07-19 进一步清理了数据库中残留的 6 个支付宝字段（`products.alipay_price_cny` / `alipay_goods_name` / `alipay_service_id`，`servers.alipay_enabled` / `alipay_seller_id` / `alipay_service_endpoint`）——代码回退后这些列已无任何引用，却仍在 schema 中误导阅读者。
+
+删除前的配置数据（商户号、人民币定价、商品名）已导出至 [`alipay-legacy-config.json`](./alipay-legacy-config.json)，恢复支付宝时需连同上述分支一并取回。
+
+注意：历史支付宝交易记录**未受影响** —— 35 笔交易的支付宝交易号仍保存在 `payments.tx_hash`，轨道标记仍为 `payments.chain = 'alipay'`，审计链路完整。
