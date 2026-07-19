@@ -27,8 +27,7 @@
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.5",
     "ethers": "^6.16.0",
-    "express": "^4.19.2",
-    "moltspay": "^0.8.15"
+    "express": "^4.19.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.10",
